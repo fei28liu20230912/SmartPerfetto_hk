@@ -139,6 +139,365 @@ describe('HTMLReportGenerator', () => {
     expect(formatted).not.toContain('μs');
   });
 
+  test('renders summary DataEnvelope provenance and metrics', () => {
+    const generator = new HTMLReportGenerator();
+    const summaryEnvelope: DataEnvelope = {
+      meta: {
+        type: 'sql_result',
+        version: '2.0.0',
+        source: 'execute_sql',
+        timestamp: Date.now(),
+        evidenceRefId: 'data:sql_summary:reference:trace-hash:query-hash:tool-hash',
+        traceSide: 'reference',
+        traceId: 'trace-ref',
+        queryHash: 'query-hash',
+        sourceToolCallId: 'execute_sql_on:1:params_hash:reference',
+        paramsHash: 'params_hash',
+        planPhaseId: 'p1',
+        planPhaseTitle: 'Compare baseline',
+        planPhaseGoal: 'Summarize reference trace',
+        producerReason: '执行参考 Trace SQL，验证对比差异。',
+      },
+      display: {
+        layer: 'overview',
+        format: 'summary',
+        title: 'Reference SQL Summary',
+      },
+      data: {
+        summary: {
+          title: 'SQL Summary (10 rows)',
+          content: 'Total rows: 10',
+          metrics: [
+            { label: 'total_rows', value: 10, severity: 'info' },
+          ],
+        },
+      } as any,
+    };
+
+    const html = generator.generateAgentDrivenHTML({
+      traceId: 'trace-4',
+      query: '对比参考 trace',
+      timestamp: Date.now(),
+      hypotheses: [],
+      dialogue: [],
+      agentResponses: [],
+      dataEnvelopes: [summaryEnvelope],
+      result: {
+        sessionId: 'session-4',
+        success: true,
+        findings: [],
+        hypotheses: [],
+        conclusion: 'ok',
+        confidence: 0.8,
+        rounds: 1,
+        totalDurationMs: 1000,
+      },
+    });
+
+    expect(html).toContain('Reference SQL Summary');
+    expect(html).toContain('data:sql_summary:reference:trace-hash:query-hash:tool-hash');
+    expect(html).toContain('阶段: p1 Compare baseline');
+    expect(html).toContain('工具调用: execute_sql_on:1:params_hash:reference');
+    expect(html).toContain('执行参考 Trace SQL，验证对比差异。');
+    expect(html).toContain('total_rows');
+    expect(html).toContain('10');
+    expect(html).not.toContain('无汇总数据');
+  });
+
+  test('renders structured conclusion claim references in report', () => {
+    const generator = new HTMLReportGenerator();
+    const evidenceRefId = 'data:sql_table:current:trace-hash:query-hash:tool-hash';
+    const sourceToolCallId = 'execute_sql:7:params_hash';
+    const envelope: DataEnvelope = {
+      meta: {
+        type: 'sql_result',
+        version: '2.0.0',
+        source: 'execute_sql',
+        timestamp: Date.now(),
+        evidenceRefId,
+        sourceToolCallId,
+      },
+      display: {
+        layer: 'list',
+        format: 'table',
+        title: 'Frame duration table',
+        columns: [
+          { name: 'frame_id', label: '帧 ID', type: 'number' as any },
+          { name: 'dur_ms', label: '帧耗时', type: 'number' as any },
+        ],
+      },
+      data: {
+        columns: ['frame_id', 'dur_ms'],
+        rows: [[1435508, 45.6]],
+      } as any,
+    };
+
+    const html = generator.generateAgentDrivenHTML({
+      traceId: 'trace-claim',
+      query: '解释掉帧来源',
+      timestamp: Date.now(),
+      hypotheses: [],
+      dialogue: [],
+      agentResponses: [],
+      dataEnvelopes: [envelope],
+      result: {
+        sessionId: 'session-claim',
+        success: true,
+        findings: [],
+        hypotheses: [],
+        conclusion: '帧 1435508 耗时 45.6ms。',
+        conclusionContract: {
+          schemaVersion: 'conclusion_contract_v1',
+          mode: 'focused_answer',
+          conclusions: [],
+          clusters: [],
+          evidenceChain: [],
+          claim_refs: [{
+            claim_id: 'Q1',
+            conclusion_id: 'C1',
+            claim: '帧 1435508 耗时 45.6ms。',
+            evidence_refs: [{
+              evidence_ref_id: evidenceRefId,
+              source_ref: '表 1',
+              tool_call_id: sourceToolCallId,
+              row_index: 0,
+              row_selector: { frame_id: 1435508 },
+              col: 'dur_ms',
+              value: 45.6,
+            }],
+          }],
+          uncertainties: [],
+          nextSteps: [],
+        },
+        confidence: 0.8,
+        rounds: 1,
+        totalDurationMs: 1000,
+      },
+    });
+
+    expect(html).toContain('逐句数据引用');
+    expect(html).toContain('Q1 / C1');
+    expect(html).toContain('帧 1435508 耗时 45.6ms。');
+    expect(html).toContain('报告来源: 数据表 1 · Frame duration table');
+    expect(html).toContain(evidenceRefId);
+    expect(html).toContain(sourceToolCallId);
+    expect(html).toContain('行号: 0 / 行选择器: frame_id=1435508');
+    expect(html).toContain('列: <code>dur_ms</code>');
+    expect(html).toContain('值: <code>45.6</code>');
+    expect(html).toContain('已找到来源表');
+  });
+
+  test('marks duplicate claim evidence refs as ambiguous unless tool call disambiguates them', () => {
+    const generator = new HTMLReportGenerator();
+    const evidenceRefId = 'data:sql_table:duplicate';
+    const firstEnvelope: DataEnvelope = {
+      meta: {
+        type: 'sql_result',
+        version: '2.0.0',
+        source: 'execute_sql',
+        timestamp: Date.now(),
+        evidenceRefId,
+        sourceToolCallId: 'execute_sql:1:params',
+      },
+      display: {
+        layer: 'list',
+        format: 'table',
+        title: 'First duplicate table',
+      },
+      data: {
+        columns: ['value'],
+        rows: [[1]],
+      } as any,
+    };
+    const secondEnvelope: DataEnvelope = {
+      ...firstEnvelope,
+      meta: {
+        ...firstEnvelope.meta,
+        sourceToolCallId: 'execute_sql:2:params',
+      },
+      display: {
+        ...firstEnvelope.display,
+        title: 'Second duplicate table',
+      },
+      data: {
+        columns: ['value'],
+        rows: [[2]],
+      } as any,
+    };
+
+    const ambiguousHtml = generator.generateAgentDrivenHTML({
+      traceId: 'trace-claim-duplicate',
+      query: '解释重复来源',
+      timestamp: Date.now(),
+      hypotheses: [],
+      dialogue: [],
+      agentResponses: [],
+      dataEnvelopes: [firstEnvelope, secondEnvelope],
+      result: {
+        sessionId: 'session-claim-duplicate',
+        success: true,
+        findings: [],
+        hypotheses: [],
+        conclusion: '值为 2。',
+        conclusionContract: {
+          claims: [{
+            id: 'Q1',
+            text: '值为 2。',
+            references: [{ evidence_ref_id: evidenceRefId, column: 'value', value: 2 }],
+          }],
+        },
+        confidence: 0.8,
+        rounds: 1,
+        totalDurationMs: 1000,
+      },
+    });
+
+    expect(ambiguousHtml).toContain('来源不唯一');
+    expect(ambiguousHtml).toContain('匹配到 2 个来源');
+
+    const disambiguatedHtml = generator.generateAgentDrivenHTML({
+      traceId: 'trace-claim-duplicate',
+      query: '解释重复来源',
+      timestamp: Date.now(),
+      hypotheses: [],
+      dialogue: [],
+      agentResponses: [],
+      dataEnvelopes: [firstEnvelope, secondEnvelope],
+      result: {
+        sessionId: 'session-claim-duplicate',
+        success: true,
+        findings: [],
+        hypotheses: [],
+        conclusion: '值为 2。',
+        conclusionContract: {
+          claims: [{
+            id: 'Q1',
+            text: '值为 2。',
+            references: [{
+              evidence_ref_id: evidenceRefId,
+              source_tool_call_id: 'execute_sql:2:params',
+              column: 'value',
+              value: 2,
+            }],
+          }],
+        },
+        confidence: 0.8,
+        rounds: 1,
+        totalDurationMs: 1000,
+      },
+    });
+
+    expect(disambiguatedHtml).toContain('报告来源: 数据表 2 · Second duplicate table');
+    expect(disambiguatedHtml).toContain('已找到来源表');
+    expect(disambiguatedHtml).not.toContain('来源不唯一');
+  });
+
+  test('falls back to visible source_ref labels when claim machine ids are missing', () => {
+    const generator = new HTMLReportGenerator();
+    const envelope: DataEnvelope = {
+      meta: {
+        type: 'sql_result',
+        version: '2.0.0',
+        source: 'execute_sql',
+        timestamp: Date.now(),
+      },
+      display: {
+        layer: 'list',
+        format: 'table',
+        title: 'Frame duration table',
+      },
+      data: {
+        columns: ['frame_id', 'dur_ms'],
+        rows: [[1435508, 45.6]],
+      } as any,
+    };
+
+    const html = generator.generateAgentDrivenHTML({
+      traceId: 'trace-source-ref-only',
+      query: '解释掉帧来源',
+      timestamp: Date.now(),
+      hypotheses: [],
+      dialogue: [],
+      agentResponses: [],
+      dataEnvelopes: [envelope],
+      result: {
+        sessionId: 'session-source-ref-only',
+        success: true,
+        findings: [],
+        hypotheses: [],
+        conclusion: '帧 1435508 耗时 45.6ms。',
+        conclusionContract: {
+          claims: [{
+            id: 'Q1',
+            text: '帧 1435508 耗时 45.6ms。',
+            references: [{
+              source_ref: '表 1',
+              row_index: 0,
+              column: 'dur_ms',
+              value: 45.6,
+            }],
+          }],
+        },
+        confidence: 0.8,
+        rounds: 1,
+        totalDurationMs: 1000,
+      },
+    });
+
+    expect(html).toContain('模型标签: <code>表 1</code>');
+    expect(html).toContain('报告来源: 数据表 1 · Frame duration table');
+    expect(html).toContain('已找到来源表');
+    expect(html).not.toContain('缺少机器 ID');
+  });
+
+  test('renders text DataEnvelope diagnostics instead of an empty table', () => {
+    const generator = new HTMLReportGenerator();
+    const diagnosticEnvelope: DataEnvelope = {
+      meta: {
+        type: 'diagnostic',
+        version: '2.0.0',
+        source: 'execute_sql',
+        timestamp: Date.now(),
+        evidenceRefId: 'data:sql_diagnostic:current:trace-hash:query-hash:tool-hash',
+        sourceToolCallId: 'execute_sql:1:params_hash',
+        planPhaseAttribution: 'inferred',
+      },
+      display: {
+        layer: 'diagnosis',
+        format: 'text',
+        title: 'SQL execution diagnostic',
+      },
+      data: {
+        text: 'SQL execution did not produce a table: bad sql',
+      } as any,
+    };
+
+    const html = generator.generateAgentDrivenHTML({
+      traceId: 'trace-5',
+      query: '分析失败 SQL',
+      timestamp: Date.now(),
+      hypotheses: [],
+      dialogue: [],
+      agentResponses: [],
+      dataEnvelopes: [diagnosticEnvelope],
+      result: {
+        sessionId: 'session-5',
+        success: true,
+        findings: [],
+        hypotheses: [],
+        conclusion: 'ok',
+        confidence: 0.8,
+        rounds: 1,
+        totalDurationMs: 1000,
+      },
+    });
+
+    expect(html).toContain('SQL execution diagnostic');
+    expect(html).toContain('SQL execution did not produce a table: bad sql');
+    expect(html).toContain('阶段归因: inferred');
+    expect(html).not.toContain('无数据');
+  });
+
   test('renders mermaid diagrams with stronger visual defaults for causal chains', () => {
     const generator = new HTMLReportGenerator();
     const html = generator.generateAgentDrivenHTML({

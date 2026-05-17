@@ -374,6 +374,16 @@ describe('verifySceneCompleteness', () => {
     expect(issues.filter(i => i.message.includes('深钻'))).toHaveLength(0);
   });
 
+  it('should count executed deep-drill tool calls even when the conclusion cites artifact names', () => {
+    const findings = [makeFinding({ title: 'Jank', description: '掉帧 freq_ramp_slow 64帧 47%' })];
+    const conclusion = '滑动分析：136 帧掉帧。代表帧证据来自 art-21 和 art-16。';
+    const issues = verifySceneCompleteness('scrolling', findings, conclusion, [
+      { toolName: 'mcp__smartperfetto__invoke_skill', timestamp: Date.now(), skillId: 'jank_frame_detail', matchedPhaseId: 'p5' },
+      { toolName: 'mcp__smartperfetto__invoke_skill', timestamp: Date.now(), skillId: 'frame_blocking_calls', matchedPhaseId: 'p5' },
+    ]);
+    expect(issues.filter(i => i.message.includes('深钻'))).toHaveLength(0);
+  });
+
   it('should warn startup scene missing TTID/TTFD', () => {
     const findings = [makeFinding({ title: 'CPU busy', description: 'Some CPU work' })];
     const issues = verifySceneCompleteness('startup', findings, 'Done');
@@ -546,6 +556,12 @@ describe('verifyHeuristic — Check 7: Truncation detection', () => {
 
   it('should not warn when conclusion ends with table row', () => {
     const conclusion = 'A'.repeat(80) + '\n| Binder 阻塞 | < 5ms | ✅ 可排除 |';
+    const issues = verifyHeuristic([], conclusion);
+    expect(issues.filter(i => i.type === 'truncation')).toHaveLength(0);
+  });
+
+  it('should not warn when conclusion ends with a structured evidence reference', () => {
+    const conclusion = 'A'.repeat(80) + '\n- evidence_ref_id=data:skill:x; source_ref=滑动区间; row_selector=session_id IN (1,2); column=session_fps; value=109.1,108.2';
     const issues = verifyHeuristic([], conclusion);
     expect(issues.filter(i => i.type === 'truncation')).toHaveLength(0);
   });

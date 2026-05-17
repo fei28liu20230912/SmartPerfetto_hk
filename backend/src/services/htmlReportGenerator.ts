@@ -31,6 +31,11 @@ import {
 import { REPORT_CAUSAL_MAP_CSS, REPORT_CAUSAL_MAP_SCRIPT } from './reportCausalMapAssets';
 import { DEFAULT_OUTPUT_LANGUAGE, localize, parseOutputLanguage, type OutputLanguage } from '../agentv3/outputLanguage';
 
+interface ClaimSourceLookupEntry {
+  label: string;
+  count: number;
+}
+
 export interface ReportData {
   sessionId: string;
   traceId: string;
@@ -90,6 +95,7 @@ export interface AgentDrivenReportData {
       contradictingEvidence: any[];
     }>;
     conclusion: string;
+    conclusionContract?: unknown;
     confidence: number;
     rounds: number;
     totalDurationMs: number;
@@ -1773,6 +1779,55 @@ export class HTMLReportGenerator {
           </div>
         ` : ''}
       </div>
+    `;
+  }
+
+  private generateSummaryFromEnvelope(
+    envelope: DataEnvelope,
+    outputLanguage: OutputLanguage = DEFAULT_OUTPUT_LANGUAGE,
+  ): string {
+    const summary = (envelope.data as any)?.summary;
+    if (!summary || typeof summary !== 'object') {
+      return `<div class="empty-state">${localize(outputLanguage, '无汇总数据', 'No summary data')}</div>`;
+    }
+
+    const title = typeof summary.title === 'string'
+      ? summary.title
+      : envelope.display?.title || localize(outputLanguage, '汇总', 'Summary');
+    const content = typeof summary.content === 'string' ? summary.content : '';
+    const metrics = Array.isArray(summary.metrics) ? summary.metrics : [];
+
+    return `
+      <div class="summary-box" style="padding: 15px; background: #f0f9ff; border-radius: 8px; border-left: 4px solid #3b82f6;">
+        <strong>${this.escapeHtml(title)}</strong>
+        ${content ? `<div style="margin-top: 8px;">${this.formatAnswer(content)}</div>` : ''}
+        ${metrics.length > 0 ? `
+          <div class="metrics-grid" style="margin-top: 12px;">
+            ${metrics.map((metric: any) => `
+              <div class="metric-card">
+                <div class="metric-label">${this.escapeHtml(metric.label || metric.name || '')}</div>
+                <div class="metric-value">${this.escapeHtml(this.stringifyValueForDisplay(metric.value, 120))}</div>
+              </div>
+            `).join('')}
+          </div>
+        ` : ''}
+      </div>
+    `;
+  }
+
+  private generateTextFromEnvelope(
+    envelope: DataEnvelope,
+    outputLanguage: OutputLanguage = DEFAULT_OUTPUT_LANGUAGE,
+  ): string {
+    const data = envelope.data as Record<string, unknown>;
+    const textValue = data?.text ?? data?.message ?? data?.error;
+    const text = typeof textValue === 'string' ? textValue : '';
+    if (!text.trim()) {
+      return `<div class="empty-state">${localize(outputLanguage, '无文本数据', 'No text data')}</div>`;
+    }
+
+    return `
+      <pre class="text-envelope" style="white-space: pre-wrap; margin: 0; padding: 12px; background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 6px; color: #111827; overflow-x: auto;">${this.escapeHtml(text)}</pre>
     `;
   }
 
@@ -4170,6 +4225,42 @@ export class HTMLReportGenerator {
       background: #f8f9fa; padding: 20px; border-radius: 8px;
       font-size: 14px; line-height: 1.5;
     }
+    .claim-source-note {
+      margin-bottom: 12px; color: #6b7280; font-size: 13px; line-height: 1.5;
+    }
+    .claim-source-card {
+      margin-bottom: 12px; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden;
+      background: #fff;
+    }
+    .claim-source-header {
+      display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px;
+      background: #f8fafc; border-bottom: 1px solid #e5e7eb; font-size: 13px;
+    }
+    .claim-source-id {
+      flex: 0 0 auto; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 11px; color: #475569; background: #e2e8f0; border-radius: 999px; padding: 2px 8px;
+    }
+    .claim-source-text { color: #1f2937; line-height: 1.5; }
+    .claim-source-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .claim-source-table th {
+      padding: 7px 9px; background: #f1f5f9; border-bottom: 1px solid #e2e8f0;
+      text-align: left; color: #475569; font-weight: 600; white-space: nowrap;
+    }
+    .claim-source-table td {
+      padding: 7px 9px; border-bottom: 1px solid #f1f5f9; color: #334155; vertical-align: top;
+    }
+    .claim-source-table code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 11px; color: #374151; background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 4px; padding: 1px 4px;
+      word-break: break-word;
+    }
+    .claim-source-status {
+      display: inline-block; border-radius: 999px; padding: 2px 8px; font-size: 11px; font-weight: 600;
+      background: #fef3c7; color: #92400e;
+    }
+    .claim-source-status.found { background: #dcfce7; color: #166534; }
+    .claim-source-status.missing { background: #fee2e2; color: #991b1b; }
+    .claim-source-status.ambiguous { background: #fef3c7; color: #92400e; }
     .timeline-list {
       display: flex; flex-direction: column; gap: 10px;
       max-height: 420px; overflow-y: auto; padding-right: 4px;
@@ -4374,6 +4465,8 @@ export class HTMLReportGenerator {
         ${this.formatAnswer(result.conclusion)}
       </div>`}
     </div>
+
+    ${this.renderConclusionClaimSourcesSection(result.conclusionContract, dataEnvelopes, outputLanguage)}
 
     <div class="footer">
       <p>${localize(outputLanguage, '由 SmartPerfetto Agent-Driven Orchestrator 生成', 'Generated by SmartPerfetto Agent-Driven Orchestrator')}</p>
@@ -4595,9 +4688,17 @@ export class HTMLReportGenerator {
   }
 
   private buildAgentEnvelopeDedupeKey(env: DataEnvelope): string {
+    const evidenceRefId = String(env.meta?.evidenceRefId || '');
+    const sourceToolCallId = String(env.meta?.sourceToolCallId || '');
+    if (evidenceRefId && sourceToolCallId) {
+      return `${evidenceRefId}:tool:${sourceToolCallId}`;
+    }
+    if (evidenceRefId) return evidenceRefId;
     const skillId = String(env.meta?.skillId || 'unknown');
     const stepId = String(env.meta?.stepId || 'unknown');
     const source = String(env.meta?.source || '').split('#')[0];
+    const traceSide = String((env.meta as any)?.traceSide || (env as any)?.traceSide || '');
+    const traceId = String((env.meta as any)?.traceId || (env as any)?.traceId || '');
     const data = env.data as any;
 
     if (data && typeof data === 'object' && Array.isArray(data.rows)) {
@@ -4605,7 +4706,7 @@ export class HTMLReportGenerator {
       const sample = rows.length > 6
         ? [...rows.slice(0, 3), ...rows.slice(-3)]
         : rows;
-      return `${skillId}:${stepId}:${rows.length}:${JSON.stringify(sample)}`;
+      return `${skillId}:${stepId}:${traceSide}:${traceId}:${rows.length}:${JSON.stringify(sample)}`;
     }
 
     const compactData = (() => {
@@ -4616,7 +4717,342 @@ export class HTMLReportGenerator {
       }
     })();
 
-    return `${skillId}:${stepId}:${source}:${compactData.slice(0, 512)}`;
+    return `${skillId}:${stepId}:${source}:${traceSide}:${traceId}:${compactData.slice(0, 512)}`;
+  }
+
+  private renderConclusionClaimSourcesSection(
+    contract: unknown,
+    envelopes: DataEnvelope[],
+    outputLanguage: OutputLanguage = DEFAULT_OUTPUT_LANGUAGE,
+  ): string {
+    const contractRecord = this.asReportRecord(contract);
+    if (!contractRecord) return '';
+
+    const claims = this.readReportAliasedRecords(contractRecord, [
+      'claims',
+      'claim_refs',
+      'claimRefs',
+      'claimReferences',
+      '逐句数据引用',
+    ]);
+    if (claims.length === 0) return '';
+
+    const sourceLookup = this.buildClaimSourceLookup(envelopes, outputLanguage);
+    const maxClaims = 30;
+    const maxReferencesPerClaim = 6;
+    const visibleClaims = claims.slice(0, maxClaims);
+    const omittedClaims = claims.length - visibleClaims.length;
+
+    const claimCards = visibleClaims.map((claim, index) => {
+      const claimId = this.readReportAliasedString(claim, ['id', 'claimId', 'claim_id']) || `claim-${index + 1}`;
+      const conclusionId = this.readReportAliasedString(claim, ['conclusionId', 'conclusion_id']);
+      const claimText = this.readReportAliasedString(claim, ['text', 'statement', 'claim', '断言']) || '';
+      const references = this.readReportAliasedRecords(claim, [
+        'references',
+        'refs',
+        'evidenceRefs',
+        'evidence_refs',
+      ]);
+      const visibleReferences = references.slice(0, maxReferencesPerClaim);
+      const omittedReferences = references.length - visibleReferences.length;
+      const idLabel = [claimId, conclusionId].filter(Boolean).join(' / ');
+
+      const referencesHtml = visibleReferences.length
+        ? `
+        <table class="claim-source-table">
+          <thead>
+            <tr>
+              <th>${this.escapeHtml(localize(outputLanguage, '来源', 'Source'))}</th>
+              <th>${this.escapeHtml(localize(outputLanguage, '定位', 'Locator'))}</th>
+              <th>${this.escapeHtml(localize(outputLanguage, '列和值', 'Column / Value'))}</th>
+              <th>${this.escapeHtml(localize(outputLanguage, '状态', 'Status'))}</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${visibleReferences.map(ref => this.renderClaimReferenceRow(ref, sourceLookup, outputLanguage)).join('')}
+            ${omittedReferences > 0 ? `
+            <tr>
+              <td colspan="4">${this.escapeHtml(localize(outputLanguage, `还有 ${omittedReferences} 条引用未展开`, `${omittedReferences} more references omitted`))}</td>
+            </tr>` : ''}
+          </tbody>
+        </table>`
+        : `<div class="empty-state">${this.escapeHtml(localize(outputLanguage, '该断言没有结构化数据引用', 'This claim has no structured data references'))}</div>`;
+
+      return `
+      <div class="claim-source-card">
+        <div class="claim-source-header">
+          <span class="claim-source-id">${this.escapeHtml(idLabel || `claim-${index + 1}`)}</span>
+          <span class="claim-source-text">${this.escapeHtml(claimText)}</span>
+        </div>
+        ${referencesHtml}
+      </div>`;
+    }).join('');
+
+    return `
+    <div class="section">
+      <h2 class="section-title">${localize(outputLanguage, '逐句数据引用', 'Claim Data References')}</h2>
+      <div class="claim-source-note">
+        ${this.escapeHtml(localize(
+          outputLanguage,
+          '以下内容来自已生成的结构化结论契约，用于把结论断言对齐到报告中的数据表、摘要或工具输出；不会再次调用模型。',
+          'The entries below come from the generated structured conclusion contract and map each claim to report tables, summaries, or tool outputs; no additional model call is made.',
+        ))}
+      </div>
+      ${claimCards}
+      ${omittedClaims > 0 ? `<div class="claim-source-note">${this.escapeHtml(localize(outputLanguage, `还有 ${omittedClaims} 条断言未展开`, `${omittedClaims} more claims omitted`))}</div>` : ''}
+    </div>`;
+  }
+
+  private renderClaimReferenceRow(
+    ref: Record<string, unknown>,
+    sourceLookup: {
+      byEvidenceAndTool: Map<string, ClaimSourceLookupEntry>;
+      byEvidenceRefId: Map<string, ClaimSourceLookupEntry>;
+      byToolCallId: Map<string, ClaimSourceLookupEntry>;
+      bySourceRef: Map<string, ClaimSourceLookupEntry>;
+    },
+    outputLanguage: OutputLanguage,
+  ): string {
+    const evidenceRefId = this.readReportAliasedString(ref, [
+      'evidenceRefId',
+      'evidence_ref_id',
+      'evidenceId',
+      'evidence_id',
+    ]);
+    const sourceToolCallId = this.readReportAliasedString(ref, [
+      'sourceToolCallId',
+      'source_tool_call_id',
+      'toolCallId',
+      'tool_call_id',
+    ]);
+    const sourceRef = this.readReportAliasedString(ref, ['sourceRef', 'source_ref']);
+    const combinedSource = evidenceRefId && sourceToolCallId
+      ? sourceLookup.byEvidenceAndTool.get(this.claimSourceCombinedKey(evidenceRefId, sourceToolCallId))
+      : undefined;
+    const source = !combinedSource && evidenceRefId
+      ? sourceLookup.byEvidenceRefId.get(evidenceRefId)
+      : undefined;
+    const fallbackSource = !combinedSource && !source && sourceToolCallId
+      ? sourceLookup.byToolCallId.get(sourceToolCallId)
+      : undefined;
+    const labelSource = !combinedSource && !source && !fallbackSource && sourceRef
+      ? sourceLookup.bySourceRef.get(this.normalizeClaimSourceRef(sourceRef))
+      : undefined;
+    const matchedSource = combinedSource || source || fallbackSource || labelSource;
+    const isAmbiguousSource = Boolean(matchedSource && matchedSource.count > 1);
+    const statusClass = isAmbiguousSource
+      ? 'ambiguous'
+      : matchedSource
+        ? 'found'
+        : (evidenceRefId || sourceToolCallId ? 'missing' : '');
+    const statusLabel = isAmbiguousSource
+      ? localize(outputLanguage, '来源不唯一', 'Ambiguous source')
+      : matchedSource
+      ? localize(outputLanguage, '已找到来源表', 'Source found')
+      : (evidenceRefId || sourceToolCallId
+        ? localize(outputLanguage, '报告中未找到', 'Missing from report')
+        : localize(outputLanguage, '缺少机器 ID', 'No machine ID'));
+
+    const sourceParts = [
+      sourceRef ? `${this.escapeHtml(localize(outputLanguage, '模型标签', 'Model label'))}: <code>${this.escapeHtml(sourceRef)}</code>` : '',
+      matchedSource && !isAmbiguousSource ? `${this.escapeHtml(localize(outputLanguage, '报告来源', 'Report source'))}: ${this.escapeHtml(matchedSource.label)}` : '',
+      matchedSource && isAmbiguousSource ? `${this.escapeHtml(localize(outputLanguage, '报告来源', 'Report source'))}: ${this.escapeHtml(localize(outputLanguage, `匹配到 ${matchedSource.count} 个来源，需补充更精确的工具调用 ID`, `${matchedSource.count} sources matched; add a more specific tool call ID`))}` : '',
+      evidenceRefId ? `${this.escapeHtml(localize(outputLanguage, '证据 ID', 'Evidence ID'))}: <code>${this.escapeHtml(evidenceRefId)}</code>` : '',
+      sourceToolCallId ? `${this.escapeHtml(localize(outputLanguage, '工具调用', 'Tool call'))}: <code>${this.escapeHtml(sourceToolCallId)}</code>` : '',
+    ].filter(Boolean);
+
+    const column = this.readReportAliasedString(ref, ['column', 'col']);
+    const value = this.readReportAliasedValue(ref, ['value']);
+    const valueText = value === undefined
+      ? ''
+      : this.stringifyValueForDisplay(value, 160);
+    const columnValueParts = [
+      column ? `${this.escapeHtml(localize(outputLanguage, '列', 'Column'))}: <code>${this.escapeHtml(column)}</code>` : '',
+      valueText ? `${this.escapeHtml(localize(outputLanguage, '值', 'Value'))}: <code>${this.escapeHtml(valueText)}</code>` : '',
+    ].filter(Boolean);
+
+    return `
+      <tr>
+        <td>${sourceParts.length ? sourceParts.map(part => `<div>${part}</div>`).join('') : '-'}</td>
+        <td>${this.escapeHtml(this.formatClaimReferenceLocator(ref, outputLanguage))}</td>
+        <td>${columnValueParts.length ? columnValueParts.map(part => `<div>${part}</div>`).join('') : '-'}</td>
+        <td><span class="claim-source-status ${statusClass}">${this.escapeHtml(statusLabel)}</span></td>
+      </tr>`;
+  }
+
+  private buildClaimSourceLookup(
+    envelopes: DataEnvelope[],
+    outputLanguage: OutputLanguage,
+  ): {
+    byEvidenceAndTool: Map<string, ClaimSourceLookupEntry>;
+    byEvidenceRefId: Map<string, ClaimSourceLookupEntry>;
+    byToolCallId: Map<string, ClaimSourceLookupEntry>;
+    bySourceRef: Map<string, ClaimSourceLookupEntry>;
+  } {
+    const byEvidenceAndTool = new Map<string, ClaimSourceLookupEntry>();
+    const byEvidenceRefId = new Map<string, ClaimSourceLookupEntry>();
+    const byToolCallId = new Map<string, ClaimSourceLookupEntry>();
+    const bySourceRef = new Map<string, ClaimSourceLookupEntry>();
+    const addLookup = (map: Map<string, ClaimSourceLookupEntry>, key: string, label: string) => {
+      const existing = map.get(key);
+      if (existing) {
+        existing.count += 1;
+        return;
+      }
+      map.set(key, { label, count: 1 });
+    };
+
+    envelopes.forEach((env, index) => {
+      const title = env.display?.title || localize(outputLanguage, `数据表 ${index + 1}`, `Data Table ${index + 1}`);
+      const label = `${localize(outputLanguage, `数据表 ${index + 1}`, `Data Table ${index + 1}`)} · ${title}`;
+      const evidenceRefId = String(env.meta?.evidenceRefId || '');
+      const sourceToolCallId = String(env.meta?.sourceToolCallId || '');
+      const sourceRefKeys = new Set(
+        this.claimSourceRefAliases(env, index + 1)
+          .map((ref) => this.normalizeClaimSourceRef(ref))
+      );
+      for (const refKey of sourceRefKeys) {
+        addLookup(bySourceRef, refKey, label);
+      }
+      if (evidenceRefId && sourceToolCallId) {
+        addLookup(byEvidenceAndTool, this.claimSourceCombinedKey(evidenceRefId, sourceToolCallId), label);
+      }
+      if (evidenceRefId) {
+        addLookup(byEvidenceRefId, evidenceRefId, label);
+      }
+      if (sourceToolCallId) {
+        addLookup(byToolCallId, sourceToolCallId, label);
+      }
+    });
+
+    return { byEvidenceAndTool, byEvidenceRefId, byToolCallId, bySourceRef };
+  }
+
+  private claimSourceCombinedKey(evidenceRefId: string, sourceToolCallId: string): string {
+    return `${evidenceRefId}\u0000${sourceToolCallId}`;
+  }
+
+  private normalizeClaimSourceRef(value: string): string {
+    const text = String(value || '').trim();
+    const chinese = text.match(/^(?:数据)?(表|摘要|指标|图|图表|文本|时间线)\s*([0-9]+)$/);
+    if (chinese) {
+      const prefixMap: Record<string, string> = {
+        表: 'table',
+        摘要: 'summary',
+        指标: 'metric',
+        图: 'chart',
+        图表: 'chart',
+        文本: 'text',
+        时间线: 'timeline',
+      };
+      return `${prefixMap[chinese[1]]}:${Number(chinese[2])}`;
+    }
+    const english = text.match(/^(?:data\s*)?(table|summary|metric|chart|figure|text|timeline)\s*([0-9]+)$/i);
+    if (english) {
+      const kind = english[1].toLowerCase() === 'figure' ? 'chart' : english[1].toLowerCase();
+      return `${kind}:${Number(english[2])}`;
+    }
+    return text.toLowerCase();
+  }
+
+  private claimSourceRefAliases(envelope: DataEnvelope, ordinal: number): string[] {
+    const format = envelope.display?.format;
+    const kind = format === 'summary'
+      ? 'summary'
+      : format === 'metric'
+        ? 'metric'
+        : format === 'chart'
+          ? 'chart'
+          : format === 'text'
+            ? 'text'
+            : format === 'timeline'
+              ? 'timeline'
+              : 'table';
+    const zhPrefix: Record<string, string[]> = {
+      table: ['表', '数据表'],
+      summary: ['摘要'],
+      metric: ['指标'],
+      chart: ['图', '图表'],
+      text: ['文本'],
+      timeline: ['时间线'],
+    };
+    const enPrefix: Record<string, string[]> = {
+      table: ['Table', 'Data Table'],
+      summary: ['Summary'],
+      metric: ['Metric'],
+      chart: ['Chart', 'Figure'],
+      text: ['Text'],
+      timeline: ['Timeline'],
+    };
+    return [
+      ...(zhPrefix[kind] || []).map((prefix) => `${prefix} ${ordinal}`),
+      ...(enPrefix[kind] || []).map((prefix) => `${prefix} ${ordinal}`),
+    ];
+  }
+
+  private formatClaimReferenceLocator(
+    ref: Record<string, unknown>,
+    outputLanguage: OutputLanguage,
+  ): string {
+    const parts: string[] = [];
+    const rowIndex = this.readReportAliasedValue(ref, ['rowIndex', 'row_index']);
+    if (rowIndex !== undefined && rowIndex !== null && rowIndex !== '') {
+      parts.push(`${localize(outputLanguage, '行号', 'Row')}: ${String(rowIndex)}`);
+    }
+
+    const rowSelector = this.readReportAliasedValue(ref, ['rowSelector', 'row_selector', 'selector']);
+    if (rowSelector !== undefined && rowSelector !== null && rowSelector !== '') {
+      parts.push(`${localize(outputLanguage, '行选择器', 'Row selector')}: ${this.formatReportSelector(rowSelector)}`);
+    }
+
+    return parts.length ? parts.join(' / ') : '-';
+  }
+
+  private formatReportSelector(selector: unknown): string {
+    const record = this.asReportRecord(selector);
+    if (!record) return this.stringifyValueForDisplay(selector, 160);
+    return Object.entries(record)
+      .map(([key, value]) => `${key}=${this.stringifyValueForDisplay(value, 80)}`)
+      .join(', ');
+  }
+
+  private asReportRecord(value: unknown): Record<string, unknown> | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    return value as Record<string, unknown>;
+  }
+
+  private readReportAliasedValue(
+    record: Record<string, unknown> | null,
+    keys: string[],
+  ): unknown {
+    if (!record) return undefined;
+    for (const key of keys) {
+      if (Object.prototype.hasOwnProperty.call(record, key)) {
+        return record[key];
+      }
+    }
+    return undefined;
+  }
+
+  private readReportAliasedString(
+    record: Record<string, unknown> | null,
+    keys: string[],
+  ): string {
+    const value = this.readReportAliasedValue(record, keys);
+    if (value === undefined || value === null) return '';
+    const text = String(value).trim();
+    return text;
+  }
+
+  private readReportAliasedRecords(
+    record: Record<string, unknown> | null,
+    keys: string[],
+  ): Array<Record<string, unknown>> {
+    const value = this.readReportAliasedValue(record, keys);
+    if (!Array.isArray(value)) return [];
+    return value
+      .map(item => this.asReportRecord(item))
+      .filter((item): item is Record<string, unknown> => Boolean(item));
   }
 
   /**
@@ -4652,22 +5088,54 @@ export class HTMLReportGenerator {
     const source = envelope.meta?.source || '';
     const skillId = envelope.meta?.skillId || '';
     const stepId = envelope.meta?.stepId || '';
+    const evidenceRefId = envelope.meta?.evidenceRefId || '';
+    const traceSide = (envelope.meta as any)?.traceSide || (envelope as any)?.traceSide || '';
+    const traceId = (envelope.meta as any)?.traceId || (envelope as any)?.traceId || '';
+    const planPhaseId = envelope.meta?.planPhaseId || '';
+    const planPhaseTitle = envelope.meta?.planPhaseTitle || '';
+    const planPhaseAttribution = (envelope.meta as any)?.planPhaseAttribution || '';
+    const planPhaseWarning = (envelope.meta as any)?.planPhaseWarning || '';
+    const sourceToolCallId = envelope.meta?.sourceToolCallId || '';
+    const producerReason = envelope.meta?.producerReason || envelope.meta?.toolNarration || '';
 
     const metaParts: string[] = [];
+    if (traceSide) {
+      metaParts.push(this.escapeHtml(traceSide === 'reference'
+        ? localize(outputLanguage, '参考 Trace', 'Reference trace')
+        : localize(outputLanguage, '当前 Trace', 'Current trace')));
+    }
     if (skillId) metaParts.push(this.escapeHtml(skillId));
     if (stepId) metaParts.push(this.escapeHtml(stepId));
     if (source && source !== skillId) metaParts.push(this.escapeHtml(source));
+    if (planPhaseId || planPhaseTitle) {
+      metaParts.push(`${this.escapeHtml(localize(outputLanguage, '阶段', 'Phase'))}: ${this.escapeHtml([planPhaseId, planPhaseTitle].filter(Boolean).join(' '))}`);
+    }
+    if (planPhaseAttribution && planPhaseAttribution !== 'active') {
+      metaParts.push(`${this.escapeHtml(localize(outputLanguage, '阶段归因', 'Phase attribution'))}: ${this.escapeHtml(planPhaseAttribution)}`);
+    }
+    if (sourceToolCallId) metaParts.push(`${this.escapeHtml(localize(outputLanguage, '工具调用', 'Tool call'))}: ${this.escapeHtml(sourceToolCallId)}`);
+    if (traceId) metaParts.push(`${this.escapeHtml(localize(outputLanguage, 'Trace', 'Trace'))}: ${this.escapeHtml(traceId)}`);
+    if (evidenceRefId) metaParts.push(`${this.escapeHtml(localize(outputLanguage, '证据', 'Evidence'))}: ${this.escapeHtml(evidenceRefId)}`);
 
-    const tableHtml = this.generateTableFromEnvelope(envelope, traceStartNs, outputLanguage);
+    let bodyHtml: string;
+    if (envelope.display?.format === 'summary') {
+      bodyHtml = this.generateSummaryFromEnvelope(envelope, outputLanguage);
+    } else if (envelope.display?.format === 'text') {
+      bodyHtml = this.generateTextFromEnvelope(envelope, outputLanguage);
+    } else {
+      bodyHtml = this.generateTableFromEnvelope(envelope, traceStartNs, outputLanguage);
+    }
 
     return `
       <div class="envelope-card">
         <div class="envelope-header">
           <div class="envelope-title">${this.escapeHtml(title)}</div>
           <div class="envelope-meta">${metaParts.join(' / ')}</div>
+          ${producerReason ? `<div class="envelope-meta">${this.escapeHtml(producerReason)}</div>` : ''}
+          ${planPhaseWarning ? `<div class="envelope-meta">${this.escapeHtml(planPhaseWarning)}</div>` : ''}
         </div>
         <div class="envelope-body">
-          ${tableHtml}
+          ${bodyHtml}
         </div>
       </div>
     `;

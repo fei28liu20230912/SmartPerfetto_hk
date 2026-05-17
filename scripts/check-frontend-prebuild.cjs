@@ -101,6 +101,16 @@ if (!exists(indexPath)) {
         }
       }
 
+      for (const requiredManifestResource of ['trace_processor.wasm', 'trace_processor_memory64.wasm']) {
+        const expectedHash = manifest.resources?.[requiredManifestResource];
+        const resourcePath = path.join(versionDir, requiredManifestResource);
+        if (!expectedHash) {
+          fail(`manifest resource is missing required hash: ${requiredManifestResource}`);
+        } else if (exists(resourcePath) && sha256Resource(resourcePath) !== expectedHash) {
+          fail(`manifest hash mismatch for ${path.relative(root, resourcePath)}`);
+        }
+      }
+
       for (const bundle of ['engine_bundle.js', 'traceconv_bundle.js']) {
         const bundlePath = path.join(versionDir, bundle);
         if (exists(bundlePath) && fileSize(bundlePath) < 100_000) {

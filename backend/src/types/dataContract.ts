@@ -276,6 +276,15 @@ function sanitizeMetadataFields(fields: unknown): string[] | undefined {
 /**
  * DataEnvelope Meta - Metadata about the data origin and version
  */
+export type DataEnvelopeTraceSide = 'current' | 'reference';
+export type DataEnvelopePlanPhaseAttribution =
+  | 'active'
+  | 'inferred'
+  | 'missing'
+  | 'ambiguous'
+  | 'unexpected_tool'
+  | 'none';
+
 export interface DataEnvelopeMeta {
   /** Data type identifier */
   type: 'skill_result' | 'sql_result' | 'ai_response' | 'diagnostic' | 'chart';
@@ -294,6 +303,48 @@ export interface DataEnvelopeMeta {
 
   /** Optional step ID within a skill */
   stepId?: string;
+
+  /** Stable evidence reference shared by UI, reports, and snapshots */
+  evidenceRefId?: string;
+
+  /** Trace side for comparison-mode outputs */
+  traceSide?: DataEnvelopeTraceSide;
+
+  /** Backend trace identifier used to produce this data */
+  traceId?: string;
+
+  /** Stable hash of the SQL or data-producing query */
+  queryHash?: string;
+
+  /** Tool-call identifier that produced this data, when available */
+  sourceToolCallId?: string;
+
+  /** Stable hash of the producing tool parameters */
+  paramsHash?: string;
+
+  /** Matched analysis plan phase ID when this data was produced */
+  planPhaseId?: string;
+
+  /** Matched analysis plan phase title when this data was produced */
+  planPhaseTitle?: string;
+
+  /** Matched analysis plan phase goal when this data was produced */
+  planPhaseGoal?: string;
+
+  /** Whether the plan phase binding is explicit enough to trust */
+  planPhaseAttribution?: DataEnvelopePlanPhaseAttribution;
+
+  /** Warning when the phase binding is missing, ambiguous, or tool-mismatched */
+  planPhaseWarning?: string;
+
+  /** One-line producer narration for this specific data output */
+  toolNarration?: string;
+
+  /** Human-readable reason this output was produced */
+  producerReason?: string;
+
+  /** Short producer intent for explaining why this table exists */
+  intent?: string;
 }
 
 /**
@@ -384,6 +435,20 @@ export function createDataEnvelope<T = DataPayload>(
     level?: DisplayLevel;
     collapsible?: boolean;
     defaultCollapsed?: boolean;
+    evidenceRefId?: string;
+    traceSide?: DataEnvelopeTraceSide;
+    traceId?: string;
+    queryHash?: string;
+    sourceToolCallId?: string;
+    paramsHash?: string;
+    planPhaseId?: string;
+    planPhaseTitle?: string;
+    planPhaseGoal?: string;
+    planPhaseAttribution?: DataEnvelopePlanPhaseAttribution;
+    planPhaseWarning?: string;
+    toolNarration?: string;
+    producerReason?: string;
+    intent?: string;
   }
 ): DataEnvelope<T> {
   const columns = sanitizeColumnDefinitions(options.columns);
@@ -397,6 +462,20 @@ export function createDataEnvelope<T = DataPayload>(
       timestamp: Date.now(),
       skillId: options.skillId,
       stepId: options.stepId,
+      evidenceRefId: options.evidenceRefId,
+      traceSide: options.traceSide,
+      traceId: options.traceId,
+      queryHash: options.queryHash,
+      sourceToolCallId: options.sourceToolCallId,
+      paramsHash: options.paramsHash,
+      planPhaseId: options.planPhaseId,
+      planPhaseTitle: options.planPhaseTitle,
+      planPhaseGoal: options.planPhaseGoal,
+      planPhaseAttribution: options.planPhaseAttribution,
+      planPhaseWarning: options.planPhaseWarning,
+      toolNarration: options.toolNarration,
+      producerReason: options.producerReason,
+      intent: options.intent,
     },
     data,
     display: {

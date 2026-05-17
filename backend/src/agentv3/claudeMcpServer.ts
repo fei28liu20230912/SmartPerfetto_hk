@@ -4,6 +4,7 @@
 
 import { tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -12,12 +13,13 @@ import type { SkillExecutor } from '../services/skillEngine/skillExecutor';
 import { getSkillAnalysisAdapter } from '../services/skillEngine/skillAnalysisAdapter';
 import { skillRegistry } from '../services/skillEngine/skillLoader';
 import { createArchitectureDetector } from '../agent/detectors/architectureDetector';
-import { displayResultToEnvelope } from '../types/dataContract';
+import { createDataEnvelope, displayResultToEnvelope } from '../types/dataContract';
 import type { DisplayResult as SkillDisplayResult } from '../services/skillEngine/types';
 import type { StreamingUpdate } from '../agent/types';
+import { phaseMatchesCall } from './types';
 import type { SqlSchemaEntry, SqlSchemaIndex, AnalysisNote, AnalysisPlanV3, PlanAspectWaiver, PlanPhase, PlanRevision, Hypothesis, UncertaintyFlag } from './types';
 import type { SceneType } from './sceneClassifier';
-import { summarizeSqlResult } from './sqlSummarizer';
+import { summarizeSqlResult, type SqlSummary } from './sqlSummarizer';
 import { matchPatterns, matchNegativePatterns, extractTraceFeatures } from './analysisPatternMemory';
 import { loadSkillNotes } from './selfImprove/skillNotesInjector';
 import {
@@ -36,10 +38,13 @@ import {
 } from '../services/traceProcessorConnectionModel';
 import { sqlUsesProcessNameFilter } from '../services/processIdentity/identityGate';
 import { injectStdlibIncludes } from './sqlIncludeInjector';
+import { normalizeRawSql } from './rawSqlNormalizer';
 import { loadPromptTemplate, getPhaseHints } from './strategyLoader';
 import { matchPhaseHintForNextPhase } from './phaseHintMatcher';
 import { buildActivePhaseReminder } from './activePhaseReminder';
 import { validatePlanAgainstSceneTemplate, MIN_WAIVER_REASON_CHARS } from './scenePlanTemplates';
+import { summarizeToolCallInput } from './toolCallSummary';
+import { formatToolCallNarration } from './toolNarration';
 import type { ArtifactStore } from './artifactStore';
 import { DEFAULT_OUTPUT_LANGUAGE, localize, type OutputLanguage } from './outputLanguage';
 import { RagStore } from '../services/ragStore';
@@ -91,16 +96,112 @@ function getBaselineStore(): BaselineStore {
   return cachedBaselineStore;
 }
 
+function quoteLooseObjectKeys(value: string): string {
+  let out = '';
+  let i = 0;
+  let inString = false;
+  let escaped = false;
+
+  while (i < value.length) {
+    const char = value[i];
+    if (inString) {
+      out += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      i++;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      out += char;
+      i++;
+      continue;
+    }
+
+    if (char === '{' || char === ',') {
+      out += char;
+      i++;
+      while (i < value.length && /\s/.test(value[i])) {
+        out += value[i++];
+      }
+      const keyStart = i;
+      if (/[A-Za-z_$]/.test(value[i] || '')) {
+        i++;
+        while (i < value.length && /[A-Za-z0-9_$]/.test(value[i])) i++;
+        const keyEnd = i;
+        let hasDanglingClosingQuote = false;
+        if (value[i] === '"') {
+          let colonIndex = i + 1;
+          while (colonIndex < value.length && /\s/.test(value[colonIndex])) colonIndex++;
+          if (value[colonIndex] === ':') {
+            hasDanglingClosingQuote = true;
+          }
+        }
+        if (hasDanglingClosingQuote) {
+          let colonIndex = i + 1;
+          while (colonIndex < value.length && /\s/.test(value[colonIndex])) colonIndex++;
+          out += `"${value.slice(keyStart, keyEnd)}"`;
+          out += value.slice(keyEnd + 1, colonIndex + 1);
+          i = colonIndex + 1;
+          continue;
+        }
+        let colonIndex = i;
+        while (colonIndex < value.length && /\s/.test(value[colonIndex])) colonIndex++;
+        if (value[colonIndex] === ':') {
+          out += `"${value.slice(keyStart, keyEnd)}"`;
+          out += value.slice(keyEnd, colonIndex + 1);
+          i = colonIndex + 1;
+          continue;
+        }
+      }
+      out += value.slice(keyStart, i);
+      continue;
+    }
+
+    out += char;
+    i++;
+  }
+
+  return out;
+}
+
 function parseToolArrayInput<T>(value: unknown): T[] | null {
   if (Array.isArray(value)) return value as T[];
   if (typeof value !== 'string') return null;
 
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed as T[] : null;
-  } catch {
-    return null;
+  const trimmed = value.trim();
+  const withoutTrailingComma = trimmed.replace(/,\s*$/, '');
+  const candidates = [
+    trimmed,
+    withoutTrailingComma,
+    quoteLooseObjectKeys(trimmed),
+    quoteLooseObjectKeys(withoutTrailingComma),
+  ].filter((entry, index, all) => entry.length > 0 && all.indexOf(entry) === index);
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      return Array.isArray(parsed) ? parsed as T[] : null;
+    } catch {
+      // Try the next normalization variant.
+    }
   }
+  return null;
+}
+
+function parseOptionalToolArrayInput<T>(value: unknown): T[] | null {
+  if (value === undefined || value === null) return [];
+  if (typeof value === 'string') {
+    const trimmed = value.trim().toLowerCase();
+    if (!trimmed || trimmed === 'null' || trimmed === 'undefined') return [];
+  }
+  return parseToolArrayInput<T>(value);
 }
 
 function parseToolStringArrayInput(value: unknown): string[] {
@@ -121,6 +222,32 @@ function parseToolStringArrayInput(value: unknown): string[] {
     .filter(Boolean);
 }
 
+function coerceOptionalInteger(
+  value: unknown,
+  field: string,
+  options: { min: number; max?: number },
+): { value?: number; error?: string } {
+  if (value === undefined || value === null || value === '') {
+    return {};
+  }
+
+  const numeric = typeof value === 'number'
+    ? value
+    : typeof value === 'string'
+      ? Number(value.trim())
+      : Number.NaN;
+  if (!Number.isInteger(numeric)) {
+    return { error: `${field} must be an integer` };
+  }
+  if (numeric < options.min) {
+    return { error: `${field} must be >= ${options.min}` };
+  }
+  if (options.max !== undefined && numeric > options.max) {
+    return { error: `${field} must be <= ${options.max}` };
+  }
+  return { value: numeric };
+}
+
 type PlanPhaseToolInput = Omit<PlanPhase, 'status' | 'expectedTools' | 'expectedCalls'> & {
   expectedTools?: unknown;
   expectedCalls?: unknown;
@@ -139,6 +266,119 @@ function normalizePlanPhaseToolInput(input: PlanPhaseToolInput): Omit<PlanPhase,
     expectedTools: parseToolStringArrayInput(input.expectedTools),
     ...(expectedCalls ? { expectedCalls } : {}),
   };
+}
+
+function isConclusionLikePlanPhase(phase: Pick<PlanPhase, 'id' | 'name' | 'goal'>): boolean {
+  const text = `${phase.id} ${phase.name} ${phase.goal}`.toLowerCase();
+  return /(综合结论|最终结论|结论输出|输出结论|输出最终报告|最终报告|综合报告|final conclusion|conclusion|final report|write final answer)/i
+    .test(text);
+}
+
+function moveConclusionPhasesLast<T extends Pick<PlanPhase, 'id' | 'name' | 'goal'>>(phases: T[]): T[] {
+  const conclusionPhases = phases.filter(isConclusionLikePlanPhase);
+  if (conclusionPhases.length === 0) return phases;
+  const nonConclusionPhases = phases.filter(phase => !isConclusionLikePlanPhase(phase));
+  return [...nonConclusionPhases, ...conclusionPhases];
+}
+
+type PhaseSemanticKind =
+  | 'architecture'
+  | 'overview'
+  | 'global_context'
+  | 'root_drill'
+  | 'gap_detection'
+  | 'conclusion';
+
+const PHASE_SEMANTIC_LABELS: Record<PhaseSemanticKind, string> = {
+  architecture: '架构检测',
+  overview: '概览采集',
+  global_context: '全局上下文',
+  root_drill: '根因深钻',
+  gap_detection: '缺帧检测',
+  conclusion: '综合结论',
+};
+
+const PHASE_SEMANTIC_PATTERNS: Array<{ kind: PhaseSemanticKind; pattern: RegExp }> = [
+  {
+    kind: 'conclusion',
+    pattern: /(综合结论|最终结论|结论输出|输出.*(?:结论|报告)|最终报告|优化建议|final conclusion|conclusion|final report|write final answer)/i,
+  },
+  {
+    kind: 'gap_detection',
+    pattern: /(缺帧|帧生产\s*gap|frame[_ -]?production[_ -]?gap|rt_no_drawframe|ui_no_frame|sf_backpressure|buffer stuffing 假阳性|gap 列表|gap overview)/i,
+  },
+  {
+    kind: 'root_drill',
+    pattern: /(根因深钻|根因诊断|代表帧|四象限|机制级|jank_frame_detail|blocking_chain|workload_heavy|lock_binder_wait|top slices?|主线程耗时|renderthread 耗时|root cause|drill)/i,
+  },
+  {
+    kind: 'global_context',
+    pattern: /(全局上下文|温控|thermal|视频|插帧|后台|background|干扰|系统干扰|global context)/i,
+  },
+  {
+    kind: 'architecture',
+    pattern: /(架构检测|渲染架构|textureview|surfaceview|webview|detect_architecture|architecture)/i,
+  },
+  {
+    kind: 'overview',
+    pattern: /(概览|批量根因分类|滑动性能概览|启动概览|启动事件|启动类型|数据质量|ttid|ttfd|dur\s*=|帧统计|掉帧分布|scrolling_analysis|startup_overview|overview|startup event|launch type)/i,
+  },
+];
+
+function inferPhaseSemanticKinds(text: string | undefined): PhaseSemanticKind[] {
+  if (!text) return [];
+  return PHASE_SEMANTIC_PATTERNS
+    .filter(({ pattern }) => pattern.test(text))
+    .map(({ kind }) => kind);
+}
+
+function findPhaseSemanticMismatch(
+  plan: AnalysisPlanV3,
+  phase: PlanPhase,
+  summary: string | undefined,
+): { summaryKind: PhaseSemanticKind; suggestedPhase: PlanPhase } | null {
+  const summaryKinds = inferPhaseSemanticKinds(summary);
+  if (summaryKinds.length === 0) return null;
+
+  const phaseKinds = new Set(inferPhaseSemanticKinds(`${phase.name} ${phase.goal}`));
+  if (phaseKinds.size === 0) return null;
+  if (summaryKinds.some(kind => phaseKinds.has(kind))) return null;
+
+  const mismatchedKind = summaryKinds.find(kind => !phaseKinds.has(kind));
+  if (!mismatchedKind) return null;
+
+  const suggestedPhase = plan.phases.find(candidate => {
+    if (candidate.id === phase.id) return false;
+    if (candidate.status === 'completed' || candidate.status === 'skipped') return false;
+    return inferPhaseSemanticKinds(`${candidate.name} ${candidate.goal}`).includes(mismatchedKind);
+  });
+
+  return suggestedPhase ? { summaryKind: mismatchedKind, suggestedPhase } : null;
+}
+
+const TIMESTAMP_EXPRESSION_PARAM_KEYS = new Set([
+  'ts',
+  'start_ts',
+  'end_ts',
+  'frame_ts',
+  'startTs',
+  'endTs',
+  'frameTs',
+]);
+
+function normalizeTimestampExpression(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  const match = trimmed.match(/^(\d{6,})([+-])(\d{1,15})$/);
+  if (!match) return value;
+  try {
+    const left = BigInt(match[1]);
+    const right = BigInt(match[3]);
+    const result = match[2] === '+' ? left + right : left - right;
+    return result.toString();
+  } catch {
+    return value;
+  }
 }
 
 /** Process-wide ProjectMemory singleton (Plan 44). Independent of the
@@ -478,6 +718,11 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
   /** Normalize skill params: ensure process_name ↔ package are both set. */
   function normalizeSkillParams(params: Record<string, any> | undefined, defaultPackage?: string): Record<string, any> {
     const p = { ...params };
+    for (const key of Object.keys(p)) {
+      if (TIMESTAMP_EXPRESSION_PARAM_KEYS.has(key)) {
+        p[key] = normalizeTimestampExpression(p[key]);
+      }
+    }
     if (defaultPackage && !p.process_name) p.process_name = defaultPackage;
     if (p.process_name && !p.package) p.package = p.process_name;
     if (p.package && !p.process_name) p.process_name = p.package;
@@ -541,6 +786,551 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     return outputLanguage === 'en' ? REASONING_NUDGE_EN : REASONING_NUDGE_ZH;
   }
 
+  let evidenceProducerOrdinal = 0;
+  type PlanPhaseAttribution = 'active' | 'inferred' | 'missing' | 'ambiguous' | 'unexpected_tool' | 'none';
+  type EvidencePhaseOverride = {
+    phaseId?: string;
+    phaseTitle?: string;
+    phaseGoal?: string;
+    attribution?: PlanPhaseAttribution;
+    warning?: string;
+  };
+
+  function phaseHasToolExpectation(phase: PlanPhase): boolean {
+    return (phase.expectedCalls?.length || 0) > 0 || (phase.expectedTools?.length || 0) > 0;
+  }
+
+  function phaseMatchesToolInput(
+    phase: PlanPhase,
+    toolName: string,
+    input: Record<string, unknown>,
+  ): boolean {
+    const skillId = typeof input.skillId === 'string' ? input.skillId : undefined;
+    return phaseMatchesCall(phase, {
+      toolName,
+      timestamp: Date.now(),
+      skillId,
+    });
+  }
+
+  function phaseSemanticScore(
+    phase: PlanPhase,
+    toolName: string,
+    input: Record<string, unknown>,
+  ): number {
+    const skillId = typeof input.skillId === 'string' ? input.skillId : undefined;
+    const sql = typeof input.sql === 'string' ? input.sql : '';
+    const expected = [
+      ...(phase.expectedTools || []),
+      ...(phase.expectedCalls || []).map(call => call.skillId || call.tool),
+    ].join(' ');
+    const text = `${phase.id} ${phase.name} ${phase.goal} ${expected}`.toLowerCase();
+    const inputText = JSON.stringify(input ?? {}).toLowerCase();
+    let score = 0;
+
+    if (skillId) {
+      const id = skillId.toLowerCase();
+      if (text.includes(id)) score += 100;
+      if (text.includes(id.replace(/_/g, ' '))) score += 60;
+      const hints: Record<string, string[]> = {
+        detect_architecture: ['架构', '渲染架构', '架构确认', '架构检测', '管线', 'pipeline', 'architecture'],
+        scrolling_analysis: ['滑动', 'scroll', '概览', '掉帧列表', '帧统计', '数据收集'],
+        startup_analysis: ['启动概览', '启动类型', '启动事件', 'startup', 'launch'],
+        startup_detail: ['启动详情', '四象限', '阻塞关系', '热点slice', '调度'],
+        startup_slow_reasons: ['慢原因', 'sr01', 'sr20', '交叉验证'],
+        memory_pressure_in_range: ['内存压力', 'memory', 'd状态', 'lmk', 'kswapd'],
+        blocking_chain_analysis: ['阻塞链', '阻塞关系', '唤醒', 'waker', 'blocked_functions', 'blocking_chain'],
+        lock_contention_in_range: ['锁竞争', 'futex', 'blocked_functions', '阻塞'],
+        binder_blocking_in_range: ['binder', '阻塞', '同步binder', 'ipc'],
+        jank_frame_detail: ['根因深钻', '单帧', '逐帧', 'jank_frame_detail', 'blocking_chain'],
+        frame_blocking_calls: ['根因深钻', '阻塞调用', 'frame_blocking_calls', 'blocking_chain'],
+        lock_binder_wait: ['根因深钻', '锁', 'binder', '阻塞', '等待', 'blocking_chain'],
+        frame_production_gap: ['缺帧', 'gap', '帧间', '隐形缺帧', '生产'],
+        batch_frame_root_cause: ['逐帧根因', 'reason_code', '根因分类'],
+      };
+      for (const hint of hints[id] || []) {
+        if (text.includes(hint.toLowerCase())) score += 20;
+      }
+      if (id === 'jank_frame_detail') {
+        if (/根因深钻|深钻|单帧|代表帧|最严重帧|机制级|detail|drill/.test(text)) score += 60;
+        if (/分布|分类|聚合|统计|batch|reason_code/.test(text) && !/深钻|单帧|代表帧|最严重帧|机制级/.test(text)) score -= 15;
+      }
+      if (id === 'blocking_chain_analysis') {
+        if (/阻塞链|阻塞关系|唤醒|waker|blocked_functions|blocking_chain|锁竞争|binder/.test(text)) score += 70;
+        if (/根因|深钻|机制|代表帧|最严重帧|单帧|深入诊断|detail|drill|root cause/.test(text)) score += 60;
+      }
+      if (id === 'memory_pressure_in_range') {
+        if (/内存压力|memory|lmk|kswapd|reclaim|gc|根因|交叉验证|排除/.test(text)) score += 70;
+      }
+      if (id === 'startup_slow_reasons') {
+        if (/慢原因|启动慢|sr\d+|sr01|sr20|根因|交叉验证|已知原因/.test(text)) score += 70;
+      }
+    }
+
+    if (toolName === 'detect_architecture') {
+      if (/架构|渲染架构|架构确认|架构检测|管线|architecture|pipeline|trace 时间范围|time range/.test(text)) score += 120;
+      if (/缺帧检测|frame_production_gap|gap detection/.test(text)) score -= 120;
+      if (/综合结论|结论|conclusion|报告|report/.test(text)) score -= 40;
+    }
+
+    if (toolName === 'fetch_artifact') {
+      if (/fetch_artifact|artifact|分页|全量|完整|掉帧数据|batch_frame_root_cause|根因数据/.test(text) &&
+        /全量|完整|掉帧|root_cause|batch_frame_root_cause|reason_code|artifact/.test(inputText)) {
+        score += 120;
+      }
+      if (/全量|完整|分页|batch_frame_root_cause|根因数据/.test(text) &&
+        /全量|完整|batch_frame_root_cause|reason_code|根因分布/.test(inputText)) {
+        score += 90;
+      }
+      if (/根因深钻|深钻|代表帧|最严重帧|机制级|blocking|jank_frame_detail|frame_blocking/.test(text) &&
+        /阻塞|blocking|代表|最严重|top_slice|jank_frame_detail|frame_blocking|主线程/.test(inputText)) {
+        score += 85;
+      }
+      if (/根因深钻|深钻|代表帧|最严重帧|机制级/.test(text) &&
+        /全量|完整|根因分布|batch_frame_root_cause/.test(inputText) &&
+        !/代表|最严重|阻塞|blocking|top_slice/.test(inputText)) {
+        score -= 40;
+      }
+      if (/概览|overview|滑动区间|帧统计|掉帧分布/.test(text) &&
+        /概览|summary|滑动区间|session|jank_type|性能概览/.test(inputText)) {
+        score += 60;
+      }
+      if (/综合结论|结论|conclusion|报告|report/.test(text)) score -= 30;
+    }
+
+    if (toolName === 'execute_sql' || toolName === 'execute_sql_on') {
+      const sqlText = sql.toLowerCase();
+      const isFrameOverviewSql =
+        /actual_frame_timeline_slice/.test(sqlText) &&
+        (
+          /min\s*\(\s*ts\s*\)/.test(sqlText) ||
+          /max\s*\(\s*ts\s*\+\s*dur\s*\)/.test(sqlText) ||
+          /count\s*\(\s*\*\s*\)/.test(sqlText) ||
+          /\b(frame_count|total_frames|layer_count)\b/.test(sqlText)
+        );
+      const isTraceRangeSql =
+        /actual_frame_timeline_slice/.test(sqlText) &&
+        /min\s*\(\s*ts\s*\)/.test(sqlText) &&
+        /max\s*\(\s*ts\s*\+\s*dur\s*\)/.test(sqlText);
+      const hasFrameOverviewPhaseHint =
+        /概览|overview|数据收集|采集|帧统计|帧率统计|滑动区间|时间范围|time range/.test(text);
+      if (isTraceRangeSql) {
+        if (/trace|时间范围|时间边界|边界|time range|range/.test(text)) score += 180;
+        if (/架构确认|确认.*架构|架构检测|检测.*架构|detect.*architecture|architecture.*detect/.test(text)) score += 60;
+        if (/hwui|producer|surfaceflinger|sf|合成|链路/.test(text) && !hasFrameOverviewPhaseHint) score -= 50;
+        if (/根因|深钻|逐帧|reason_code|综合结论|报告/.test(text) && !hasFrameOverviewPhaseHint) score -= 50;
+      }
+      if (isFrameOverviewSql) {
+        if (hasFrameOverviewPhaseHint) score += 80;
+        if (/根因|深钻|逐帧|diagnos|root cause/.test(text)) score -= 20;
+      }
+      const isRootCauseDrillSql = /\b(thread|thread_state|thread_slice|thread_track|slice|slice_self_dur|sched|futex|binder|blocking|root_cause|reason_code|top_slice|main_q4b|__intrinsic_batch_frame_root_cause)\b/.test(sqlText);
+      if (isRootCauseDrillSql) {
+        if (/根因|深钻|机制|阻塞|代表帧|逐帧|单帧|detail|drill|root cause|blocking/.test(text)) score += 80;
+        if (/概览|overview|帧统计|掉帧分布|数据收集|采集/.test(text)) score -= 10;
+      }
+      const isWebViewStartupSql = /webview|chromium|v8|crrenderermain|parsehtml|drawgl/.test(sqlText);
+      if (isWebViewStartupSql) {
+        if (/webview|chromium|v8|crrenderermain|parsehtml|drawgl|页面渲染/.test(text)) score += 140;
+        if (/综合结论|结论|conclusion|报告|report/.test(text) && !/webview|chromium|v8/.test(text)) score -= 30;
+      }
+      const sqlHints: Array<[RegExp, string[]]> = [
+        [/webview|chromium|v8|crrenderermain|parsehtml|drawgl/, ['webview', 'chromium', 'v8', '页面渲染']],
+        [/actual_frame_timeline|expected_frame_timeline|jank|frame/, ['滑动', '掉帧', '帧', 'frame']],
+        [/\bthread\b|thread_state|thread_slice|slice_self_dur|sched|cpu|freq/, ['线程', '调度', 'cpu', '频率', '热点', '主线程', '阻塞']],
+        [/memory|lmk|kswapd|reclaim/, ['内存', 'memory', 'lmk']],
+      ];
+      for (const [pattern, hints] of sqlHints) {
+        if (!pattern.test(sqlText)) continue;
+        for (const hint of hints) {
+          if (text.includes(hint.toLowerCase())) score += 15;
+        }
+      }
+    }
+
+    return score;
+  }
+
+  function inferSemanticPhase(
+    phases: PlanPhase[],
+    toolName: string,
+    input: Record<string, unknown>,
+  ): PlanPhase | undefined {
+    const scored = phases
+      .map(phase => ({ phase, score: phaseSemanticScore(phase, toolName, input) }))
+      .filter(item => item.score > 0)
+      .sort((a, b) => b.score - a.score);
+    if (scored.length === 0) return undefined;
+    if (scored.length === 1 || scored[0].score > scored[1].score) return scored[0].phase;
+    return undefined;
+  }
+
+  function autoStartPhaseForEvidence(
+    phase: PlanPhase,
+    toolName: string,
+    input: Record<string, unknown>,
+  ): boolean {
+    const plan = analysisPlanRef?.current;
+    if (!plan || phase.status !== 'pending') return false;
+
+    closeSupersededInProgressPhases(plan, phase);
+    phase.status = 'in_progress';
+    phase.completedAt = undefined;
+    phase.summary = undefined;
+
+    const narration = formatToolCallNarration(toolName, input, outputLanguage);
+    const summary = localize(
+      outputLanguage,
+      `自动进入阶段：${narration}`,
+      `Auto-started phase for: ${narration}`,
+    ).slice(0, 260);
+
+    emitUpdate?.({
+      type: 'plan_phase_updated',
+      content: { phaseId: phase.id, status: 'in_progress', summary, phaseName: phase.name },
+      timestamp: Date.now(),
+    });
+
+    return true;
+  }
+
+  function autoClosedPhaseSummary(closedPhase: PlanPhase, nextPhase: PlanPhase): string {
+    const artifacts = typeof artifactStore?.serialize === 'function'
+      ? artifactStore.serialize().filter(artifact => artifact.planPhaseId === closedPhase.id)
+      : [];
+    const titles = Array.from(new Set(
+      artifacts
+        .map(artifact => artifact.title || artifact.stepId)
+        .filter((title): title is string => typeof title === 'string' && title.trim().length > 0)
+    )).slice(0, 4);
+    const skillIds = Array.from(new Set(
+      artifacts
+        .map(artifact => artifact.skillId)
+        .filter((skillId): skillId is string => typeof skillId === 'string' && skillId.trim().length > 0)
+    )).slice(0, 3);
+    const moreCount = Math.max(0, artifacts.length - titles.length);
+    const titleSummary = titles.length
+      ? localize(
+          outputLanguage,
+          `：${titles.join('、')}${moreCount > 0 ? `等 ${moreCount} 个` : ''}`,
+          `: ${titles.join(', ')}${moreCount > 0 ? ` and ${moreCount} more` : ''}`,
+        )
+      : '';
+    const evidenceSummary = artifacts.length > 0
+      ? localize(
+          outputLanguage,
+          `本阶段已产生 ${artifacts.length} 个证据表${skillIds.length ? `（来源：${skillIds.join('、')}）` : ''}${titleSummary}。`,
+          `This phase produced ${artifacts.length} evidence table(s)${skillIds.length ? ` from ${skillIds.join(', ')}` : ''}${titleSummary}.`,
+        )
+      : localize(
+          outputLanguage,
+          `本阶段未记录 artifact，但已保留该阶段的工具调用和时间线事件。`,
+          `This phase did not record artifacts, but its tool calls and timeline events remain available.`,
+        );
+    return localize(
+      outputLanguage,
+      `自动完成阶段「${closedPhase.name}」：已进入后续阶段「${nextPhase.name}」。${evidenceSummary}阶段目标：${closedPhase.goal}。上一阶段未收到显式完成摘要。`,
+      `Auto-completed phase "${closedPhase.name}" after moving to "${nextPhase.name}". ${evidenceSummary} Phase goal: ${closedPhase.goal}. The previous phase did not provide an explicit completion summary.`,
+    );
+  }
+
+  function closeSupersededInProgressPhases(plan: AnalysisPlanV3, nextPhase: PlanPhase): void {
+    const nextIndex = plan.phases.findIndex(p => p.id === nextPhase.id);
+    for (const other of plan.phases) {
+      if (other.id === nextPhase.id || other.status !== 'in_progress') continue;
+
+      const otherIndex = plan.phases.findIndex(p => p.id === other.id);
+      if (otherIndex >= 0 && nextIndex >= 0 && otherIndex < nextIndex) {
+        const summary = autoClosedPhaseSummary(other, nextPhase);
+        other.status = 'completed';
+        other.completedAt = Date.now();
+        other.summary = summary;
+        emitUpdate?.({
+          type: 'plan_phase_updated',
+          content: { phaseId: other.id, status: 'completed', summary, phaseName: other.name },
+          timestamp: Date.now(),
+        });
+      } else {
+        other.status = 'pending';
+        other.completedAt = undefined;
+        other.summary = undefined;
+      }
+    }
+  }
+
+  function laterInProgressPhase(plan: AnalysisPlanV3, phase: PlanPhase): PlanPhase | undefined {
+    const phaseIndex = plan.phases.findIndex(p => p.id === phase.id);
+    if (phaseIndex < 0) return undefined;
+    return plan.phases.find((p, index) => p.status === 'in_progress' && index > phaseIndex);
+  }
+
+  function bindPendingPhaseForEvidence(
+    phase: PlanPhase,
+    toolName: string,
+    input: Record<string, unknown>,
+  ): { phase: PlanPhase; attribution: PlanPhaseAttribution; warning?: string } {
+    const plan = analysisPlanRef?.current;
+    const laterActive = plan ? laterInProgressPhase(plan, phase) : undefined;
+    if (plan && phase.status === 'pending' && laterActive) {
+      const narration = formatToolCallNarration(toolName, input, outputLanguage);
+      const summary = localize(
+        outputLanguage,
+        `自动补记阶段：收到本阶段证据（${narration}），但当前已在后续阶段「${laterActive.name}」。该阶段直接标记完成，证据以推断方式绑定。`,
+        `Backfilled phase evidence (${narration}) while later phase "${laterActive.name}" was active. Marked this phase complete and bound the evidence as inferred.`,
+      ).slice(0, 260);
+      phase.status = 'completed';
+      phase.completedAt = Date.now();
+      phase.summary = summary;
+      emitUpdate?.({
+        type: 'plan_phase_updated',
+        content: { phaseId: phase.id, status: 'completed', summary, phaseName: phase.name },
+        timestamp: Date.now(),
+      });
+      return {
+        phase,
+        attribution: 'inferred',
+        warning: localize(
+          outputLanguage,
+          `证据语义匹配较早阶段 "${phase.name}"，但当前已在后续阶段 "${laterActive.name}"；已按补记阶段绑定，需要核对顺序。`,
+          `Evidence semantically matched earlier phase "${phase.name}" while later phase "${laterActive.name}" was active; bound as a backfilled phase and should be checked for ordering.`,
+        ),
+      };
+    }
+
+    autoStartPhaseForEvidence(phase, toolName, input);
+    return { phase, attribution: 'active' };
+  }
+
+  function activePlanPhaseForEvidence(
+    toolName: string,
+    input: Record<string, unknown>,
+  ): { phase?: PlanPhase; attribution: PlanPhaseAttribution; warning?: string } {
+    const plan = analysisPlanRef?.current;
+    if (!plan) return { attribution: 'none' };
+
+    const active = plan.phases.filter(p => p.status === 'in_progress');
+    if (active.length === 0) {
+      const isRawSqlTool = toolName === 'execute_sql' || toolName === 'execute_sql_on';
+      if (isRawSqlTool) {
+        const semanticPending = inferSemanticPhase(
+          plan.phases.filter(p => p.status === 'pending'),
+          toolName,
+          input,
+        );
+        if (semanticPending) {
+          return bindPendingPhaseForEvidence(semanticPending, toolName, input);
+        }
+        const semanticRecentCompleted = inferSemanticPhase(
+          plan.phases
+            .filter(p =>
+              p.status === 'completed' &&
+              typeof p.completedAt === 'number' &&
+              Date.now() - p.completedAt <= 5 * 60 * 1000
+            )
+            .sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0)),
+          toolName,
+          input,
+        );
+        if (semanticRecentCompleted) {
+          return {
+            phase: semanticRecentCompleted,
+            attribution: 'inferred',
+            warning: localize(
+              outputLanguage,
+              `当前没有明确进行中的 plan 阶段；已按 SQL 内容绑定到最近完成的阶段 "${semanticRecentCompleted.name}"，需要核对。`,
+              `No plan phase is explicitly in progress; bound to the recently completed phase "${semanticRecentCompleted.name}" by SQL content and should be verified.`,
+            ),
+          };
+        }
+      }
+
+      const matchingPending = plan.phases.filter(p =>
+        p.status === 'pending' &&
+        phaseHasToolExpectation(p) &&
+        phaseMatchesToolInput(p, toolName, input)
+      );
+      if (matchingPending.length === 1) {
+        const phase = matchingPending[0];
+        return bindPendingPhaseForEvidence(phase, toolName, input);
+      }
+      if (matchingPending.length > 1) {
+        const phase = inferSemanticPhase(matchingPending, toolName, input);
+        if (phase) {
+          return bindPendingPhaseForEvidence(phase, toolName, input);
+        }
+        return {
+          attribution: 'ambiguous',
+          warning: localize(
+            outputLanguage,
+            `当前没有明确进行中的 plan 阶段，且 ${matchingPending.length} 个待执行阶段都匹配 ${toolName}；此数据未绑定具体阶段。`,
+            `No plan phase is explicitly in progress and ${matchingPending.length} pending phases match ${toolName}; this data is not bound to a concrete phase.`,
+          ),
+        };
+      }
+      const recentCompleted = plan.phases
+        .filter(p =>
+          p.status === 'completed' &&
+          typeof p.completedAt === 'number' &&
+          Date.now() - p.completedAt <= 5 * 60 * 1000 &&
+          phaseHasToolExpectation(p) &&
+          phaseMatchesToolInput(p, toolName, input)
+        )
+        .sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0));
+      if (recentCompleted.length > 0) {
+        const phase = inferSemanticPhase(recentCompleted, toolName, input) || recentCompleted[0];
+        return {
+          phase,
+          attribution: 'inferred',
+          warning: localize(
+            outputLanguage,
+            `当前没有明确进行中的 plan 阶段；已绑定到最近完成且匹配工具的阶段 "${phase.name}"，需要核对。`,
+            `No plan phase is explicitly in progress; bound to the most recently completed matching phase "${phase.name}" and should be verified.`,
+          ),
+        };
+      }
+      const semanticPending = inferSemanticPhase(
+        plan.phases.filter(p => p.status === 'pending' && phaseHasToolExpectation(p)),
+        toolName,
+        input,
+      );
+      if (semanticPending) {
+        return bindPendingPhaseForEvidence(semanticPending, toolName, input);
+      }
+      return {
+        attribution: 'missing',
+        warning: localize(
+          outputLanguage,
+          '当前没有明确进行中的 plan 阶段；此数据未绑定具体阶段。',
+          'No plan phase is explicitly in progress; this data is not bound to a concrete phase.',
+        ),
+      };
+    }
+    if (active.length > 1) {
+      return {
+        attribution: 'ambiguous',
+        warning: localize(
+          outputLanguage,
+          `当前有 ${active.length} 个 plan 阶段同时进行；此数据未绑定具体阶段。`,
+          `${active.length} plan phases are in progress at the same time; this data is not bound to a concrete phase.`,
+        ),
+      };
+    }
+
+    const phase = active[0];
+    const skillId = typeof input.skillId === 'string' ? input.skillId : undefined;
+    if (phaseHasToolExpectation(phase) && !phaseMatchesToolInput(phase, toolName, input)) {
+      const activeSemanticScore = phaseSemanticScore(phase, toolName, input);
+      const matchingPending = plan.phases.filter(p =>
+        p.status === 'pending' &&
+        phaseHasToolExpectation(p) &&
+        phaseMatchesToolInput(p, toolName, input)
+      );
+      const inferredPhase = matchingPending.length === 1
+        ? matchingPending[0]
+        : inferSemanticPhase(matchingPending, toolName, input);
+      if (inferredPhase) {
+        const inferredSemanticScore = phaseSemanticScore(inferredPhase, toolName, input);
+        if (activeSemanticScore >= 50 && inferredSemanticScore < activeSemanticScore + 30) {
+          return { phase, attribution: 'active' };
+        }
+        return bindPendingPhaseForEvidence(inferredPhase, toolName, input);
+      }
+      const semanticPending = inferSemanticPhase(
+        plan.phases.filter(p => p.status === 'pending' && phaseHasToolExpectation(p)),
+        toolName,
+        input,
+      );
+      if (semanticPending && phaseSemanticScore(semanticPending, toolName, input) >= 50) {
+        return bindPendingPhaseForEvidence(semanticPending, toolName, input);
+      }
+      if (activeSemanticScore >= 50) {
+        return { phase, attribution: 'active' };
+      }
+      return {
+        phase,
+        attribution: 'unexpected_tool',
+        warning: localize(
+          outputLanguage,
+          `当前阶段 "${phase.name}" 未声明会调用 ${toolName}${skillId ? `(${skillId})` : ''}；此阶段归因需要人工核对。`,
+          `Active phase "${phase.name}" did not declare ${toolName}${skillId ? `(${skillId})` : ''}; verify this phase attribution.`,
+        ),
+      };
+    }
+
+    const activeSemanticScore = phaseSemanticScore(phase, toolName, input);
+    const semanticPending = inferSemanticPhase(
+      plan.phases.filter(p => p.status === 'pending' && phaseHasToolExpectation(p)),
+      toolName,
+      input,
+    );
+    if (semanticPending) {
+      const pendingSemanticScore = phaseSemanticScore(semanticPending, toolName, input);
+      if (pendingSemanticScore >= 50 && pendingSemanticScore >= activeSemanticScore + 30) {
+        return bindPendingPhaseForEvidence(semanticPending, toolName, input);
+      }
+    }
+
+    return { phase, attribution: 'active' };
+  }
+
+  function createEvidenceProducerContext(
+    toolName: string,
+    input: Record<string, unknown>,
+    producerReason: string,
+    suffix?: string,
+    phaseOverride?: EvidencePhaseOverride,
+  ): EvidenceProducerContext {
+    const summary = summarizeToolCallInput(toolName, input);
+    const phaseResolution = phaseOverride?.phaseId
+      ? undefined
+      : activePlanPhaseForEvidence(toolName, input);
+    const phase = phaseResolution?.phase;
+    const paramsHash = summary.paramsHash || evidenceHash(input);
+    const ordinal = ++evidenceProducerOrdinal;
+    const sourceToolCallId = [
+      toolName,
+      ordinal,
+      paramsHash,
+      suffix,
+    ].filter(Boolean).join(':');
+    return {
+      sourceToolCallId,
+      paramsHash,
+      planPhaseId: phaseOverride?.phaseId ?? phase?.id,
+      planPhaseTitle: phaseOverride?.phaseTitle ?? phase?.name,
+      planPhaseGoal: phaseOverride?.phaseGoal ?? phase?.goal,
+      planPhaseAttribution: phaseOverride?.attribution ?? phaseResolution?.attribution,
+      planPhaseWarning: phaseOverride?.warning ?? phaseResolution?.warning,
+      toolNarration: formatToolCallNarration(toolName, input, outputLanguage),
+      producerReason,
+    };
+  }
+
+  async function detectArchitecturePayload(): Promise<Record<string, unknown>> {
+    if (options.cachedArchitecture) {
+      const info = options.cachedArchitecture;
+      return {
+        type: info.type,
+        confidence: info.confidence,
+        evidence: (info.evidence ?? []).map(e => ({ source: e.source, type: e.type, weight: e.weight })),
+        flutter: info.flutter,
+        compose: info.compose,
+        webview: info.webview,
+        cached: true,
+      };
+    }
+    const detector = createArchitectureDetector();
+    const info = await detector.detect({ traceId, traceProcessorService, packageName });
+    return {
+      type: info.type,
+      confidence: info.confidence,
+      evidence: (info.evidence ?? []).map(e => ({ source: e.source, type: e.type, weight: e.weight })),
+      flutter: info.flutter,
+      compose: info.compose,
+      webview: info.webview,
+    };
+  }
+
   // Auto-inject `INCLUDE PERFETTO MODULE ...;` for stdlib tables/functions
   // referenced in raw SQL. Shared between execute_sql and execute_sql_on
   // so comparison-mode queries get the same treatment. See
@@ -550,7 +1340,8 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     sql: string,
     traceSide: TraceProcessorTraceSide = 'current',
   ) {
-    const { sql: finalSql, injected } = injectStdlibIncludes(sql);
+    const normalized = normalizeRawSql(sql);
+    const { sql: finalSql, injected } = injectStdlibIncludes(normalized.sql);
     const traceProvenance = buildTraceProcessorQueryProvenance({
       traceId: targetTraceId,
       traceSide,
@@ -570,7 +1361,14 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       });
     }
     const result = await traceProcessorService.query(targetTraceId, finalSql);
-    return { result, finalSql, injected, traceProvenance };
+    return {
+      result,
+      finalSql,
+      injected,
+      traceProvenance,
+      normalizedSql: normalized.sql,
+      sqlRewrites: normalized.rewrites,
+    };
   }
 
   const executeSql = tool(
@@ -579,6 +1377,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     'Returns columnar results. Set summary=true for large result sets to get column statistics + sample rows.\n\n' +
     'Use when: ad-hoc queries not covered by existing skills, verifying hypotheses with specific SQL, checking raw data.\n' +
     'Don\'t use when: a matching skill exists (use invoke_skill instead — richer layered output), or you need schema info (use lookup_sql_schema first).\n\n' +
+    'SQL safety rules: qualify duplicate column names after JOINs. Do not write bare SELECT name/ts/dur when joining slice/thread/process; use s.name AS slice_name, s.ts, s.dur, t.name AS thread_name, p.name AS process_name, or prefer the thread_slice stdlib view. FrameTimeline rows expose upid, not utid/process_name; use JOIN process USING(upid) for actual_frame_timeline_slice. thread_slice does not expose self_dur directly; JOIN slice_self_dur USING(id) when self time is needed. When using thread_slice, read thread_name and process_name directly; do not write t.name or p.name unless JOIN thread t or JOIN process p is present. Do not query __intrinsic_* names or skill step names such as batch_frame_root_cause as SQL tables; they are skill artifacts, use fetch_artifact for those rows.\n\n' +
     'Examples:\n' +
     '1. Count jank frames: sql="SELECT COUNT(*) as jank_count FROM actual_frame_timeline_slice WHERE jank_type != \'None\'", summary=false\n' +
     '2. CPU frequency overview: sql="SELECT cpu, MIN(value) as min_freq, MAX(value) as max_freq, AVG(value) as avg_freq FROM counter JOIN counter_track ON counter.track_id=counter_track.id WHERE counter_track.name GLOB \'cpu*freq\' GROUP BY cpu", summary=true\n' +
@@ -597,14 +1396,19 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       if (planError) {
         return { content: [{ type: 'text' as const, text: planError }] };
       }
+      const producer = createEvidenceProducerContext(
+        'execute_sql',
+        { sql, summary },
+        localize(outputLanguage, '执行当前 Trace SQL，验证本阶段的具体数据点。', 'Run SQL on the current trace to verify this phase of evidence.'),
+      );
       try {
         const sqlStart = Date.now();
-        const processIdentityWarning = rawSqlProcessIdentityWarning(sql);
-        const { result, finalSql, injected, traceProvenance } = await runRawSqlWithIncludeInjection(
+        const { result, finalSql, injected, traceProvenance, normalizedSql, sqlRewrites } = await runRawSqlWithIncludeInjection(
           traceId,
           sql,
           'current',
         );
+        const processIdentityWarning = rawSqlProcessIdentityWarning(normalizedSql);
         const truncated = result.rows.length > 200;
         const rows = truncated ? result.rows.slice(0, 200) : result.rows;
         const success = !result.error;
@@ -625,9 +1429,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           });
         }
 
-        if (emitUpdate && success && result.columns.length > 0 && rows.length > 0) {
-          emitSqlDataEnvelope(emitUpdate, result.columns, rows, finalSql, injected, traceProvenance);
-        }
+        let emittedEvidence: { evidenceRefId: string; queryHash: string } | undefined;
 
         if (emitUpdate && !success && result.error) {
           emitUpdate({
@@ -682,6 +1484,16 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         // Summary mode: return column statistics + sample rows instead of raw data
         if (summary && success && rows.length > 0) {
           const summaryResult = summarizeSqlResult(result.columns, result.rows);
+          if (emitUpdate) {
+            emittedEvidence = emitSqlSummaryDataEnvelope(
+              emitUpdate,
+              summaryResult,
+              finalSql,
+              injected,
+              traceProvenance,
+              producer,
+            );
+          }
           return {
             content: [{
               type: 'text' as const,
@@ -696,12 +1508,31 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
                 traceSide: traceProvenance.traceSide,
                 traceId: traceProvenance.traceId,
                 traceProvenance,
+                evidenceRefId: emittedEvidence?.evidenceRefId,
+                sourceToolCallId: producer.sourceToolCallId,
+                paramsHash: producer.paramsHash,
+                planPhaseId: producer.planPhaseId,
                 executableSql: finalSql,
+                ...(sqlRewrites.length > 0 ? { sqlRewrites } : {}),
                 stdlibInjectedModules: injected,
                 ...(processIdentityWarning ? { processIdentityWarning } : {}),
               })) + getReasoningNudge(),
             }],
           };
+        }
+
+        if (emitUpdate && success && result.columns.length > 0) {
+          emittedEvidence = emitSqlDataEnvelope(emitUpdate, result.columns, rows, finalSql, injected, traceProvenance, producer);
+        } else if (emitUpdate && !success) {
+          emittedEvidence = emitSqlDiagnosticDataEnvelope(
+            emitUpdate,
+            result.error || localize(outputLanguage, 'SQL 执行失败', 'SQL execution failed'),
+            finalSql,
+            injected,
+            traceProvenance,
+            producer,
+            outputLanguage,
+          );
         }
 
         return {
@@ -717,7 +1548,12 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
               traceSide: traceProvenance.traceSide,
               traceId: traceProvenance.traceId,
               traceProvenance,
+              evidenceRefId: emittedEvidence?.evidenceRefId,
+              sourceToolCallId: producer.sourceToolCallId,
+              paramsHash: producer.paramsHash,
+              planPhaseId: producer.planPhaseId,
               executableSql: finalSql,
+              ...(sqlRewrites.length > 0 ? { sqlRewrites } : {}),
               stdlibInjectedModules: injected,
               ...(processIdentityWarning ? { processIdentityWarning } : {}),
               ...(result.error ? { error: result.error } : {}),
@@ -726,6 +1562,19 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         };
       } catch (err) {
         const errMsg = (err as Error).message;
+        const traceProvenance = buildTraceProcessorQueryProvenance({
+          traceId,
+          traceSide: 'current',
+        });
+        const emittedEvidence = emitUpdate ? emitSqlDiagnosticDataEnvelope(
+          emitUpdate,
+          errMsg,
+          sql,
+          undefined,
+          traceProvenance,
+          producer,
+          outputLanguage,
+        ) : undefined;
         emitUpdate?.({
           type: 'progress',
           content: {
@@ -735,7 +1584,17 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           timestamp: Date.now(),
         });
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: errMsg }) }],
+          content: [{ type: 'text' as const, text: JSON.stringify({
+            success: false,
+            traceSide: 'current',
+            traceId,
+            traceProvenance,
+            evidenceRefId: emittedEvidence?.evidenceRefId,
+            sourceToolCallId: producer.sourceToolCallId,
+            paramsHash: producer.paramsHash,
+            planPhaseId: producer.planPhaseId,
+            error: errMsg,
+          }) }],
           isError: true,
         };
       }
@@ -767,6 +1626,65 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         return { content: [{ type: 'text' as const, text: skillPlanError }] };
       }
 
+      if (skillId === 'detect_architecture') {
+        const effectiveParams = normalizeSkillParams(params, packageName);
+        const producer = createEvidenceProducerContext(
+          'invoke_skill',
+          { skillId, params: effectiveParams },
+          localize(outputLanguage, '调用 Skill detect_architecture，确认渲染架构并决定后续分析链路。', 'Run Skill detect_architecture to identify the rendering pipeline for later analysis.'),
+        );
+        try {
+          emitUpdate?.({
+            type: 'progress',
+            content: {
+              phase: 'analyzing',
+              message: localize(outputLanguage, '检测渲染架构...', 'Detecting rendering architecture...'),
+            },
+            timestamp: Date.now(),
+          });
+          const payload = await detectArchitecturePayload();
+          emitUpdate?.({
+            type: 'progress',
+            content: {
+              phase: 'analyzing',
+              message: localize(
+                outputLanguage,
+                `架构检测完成: ${String(payload.type ?? 'unknown')} (置信度 ${Math.round(Number(payload.confidence ?? 0) * 100)}%)`,
+                `Architecture detection completed: ${String(payload.type ?? 'unknown')} (${Math.round(Number(payload.confidence ?? 0) * 100)}% confidence)`,
+              ),
+            },
+            timestamp: Date.now(),
+          });
+          return {
+            content: [{
+              type: 'text' as const,
+              text: consumeWatchdogWarning(JSON.stringify({
+                success: true,
+                skillId: 'detect_architecture',
+                delegatedTool: 'detect_architecture',
+                sourceToolCallId: producer.sourceToolCallId,
+                paramsHash: producer.paramsHash,
+                planPhaseId: producer.planPhaseId,
+                ...payload,
+              })) + getReasoningNudge(),
+            }],
+          };
+        } catch (err) {
+          const errMsg = (err as Error).message;
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify({
+                success: false,
+                skillId,
+                sourceToolCallId: producer.sourceToolCallId,
+                paramsHash: producer.paramsHash,
+                planPhaseId: producer.planPhaseId,
+                error: errMsg,
+              }) }],
+            isError: true,
+          };
+        }
+      }
+
       // Guard: metadata-only skills are not executable single-trace analysis skills
       const skillDef = skillRegistry.getSkill(skillId);
       if (skillDef?.type === 'pipeline_definition' || skillDef?.type === 'comparison') {
@@ -786,6 +1704,11 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
 
       try {
         const effectiveParams = normalizeSkillParams(params, packageName);
+        const producer = createEvidenceProducerContext(
+          'invoke_skill',
+          { skillId, params: effectiveParams },
+          localize(outputLanguage, `调用 Skill ${skillId}，收集本阶段结构化证据。`, `Run Skill ${skillId} to collect structured evidence for this phase.`),
+        );
 
         emitUpdate?.({
           type: 'progress',
@@ -829,7 +1752,13 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         }
 
         if (emitUpdate && result.displayResults?.length) {
-          emitSkillDataEnvelopes(result.displayResults as SkillDisplayResult[], result.skillId || skillId, emitUpdate);
+          emitSkillDataEnvelopes(
+            result.displayResults as SkillDisplayResult[],
+            result.skillId || skillId,
+            emitUpdate,
+            undefined,
+            producer,
+          );
         }
 
         if (onSkillResult && result.success && result.displayResults?.length) {
@@ -879,6 +1808,11 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
               title: dr.title,
               data: dr.data,
               diagnostics: undefined,
+              planPhaseId: producer.planPhaseId,
+              planPhaseTitle: producer.planPhaseTitle,
+              planPhaseGoal: producer.planPhaseGoal,
+              sourceToolCallId: producer.sourceToolCallId,
+              paramsHash: producer.paramsHash,
             });
             const summary = artifactStore.generateCompactSummary(artId);
             return summary;
@@ -894,6 +1828,11 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
               title: `${skillId} diagnostics`,
               data: { columns: ['diagnostic'], rows: result.diagnostics.map((d: any) => [d]) },
               diagnostics: result.diagnostics,
+              planPhaseId: producer.planPhaseId,
+              planPhaseTitle: producer.planPhaseTitle,
+              planPhaseGoal: producer.planPhaseGoal,
+              sourceToolCallId: producer.sourceToolCallId,
+              paramsHash: producer.paramsHash,
             });
           }
 
@@ -913,6 +1852,11 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
                   layer: sd.layer || 'synthesize',
                   title: sd.stepName || sd.stepId,
                   data: normalizedData,
+                  planPhaseId: producer.planPhaseId,
+                  planPhaseTitle: producer.planPhaseTitle,
+                  planPhaseGoal: producer.planPhaseGoal,
+                  sourceToolCallId: producer.sourceToolCallId,
+                  paramsHash: producer.paramsHash,
                 });
                 return {
                   artifactId: artId,
@@ -1034,43 +1978,33 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     'Call this early to understand which analysis approach to use.',
     {},
     async () => {
+      const producer = createEvidenceProducerContext(
+        'detect_architecture',
+        {},
+        localize(outputLanguage, '检测渲染架构，确定后续分析路径。', 'Detect rendering architecture to choose the later analysis path.'),
+      );
       try {
-        // Return cached result if available (already detected in analyze())
-        if (options.cachedArchitecture) {
-          const info = options.cachedArchitecture;
-          return {
-            content: [{
-              type: 'text' as const,
-              text: JSON.stringify({
-                type: info.type,
-                confidence: info.confidence,
-                evidence: info.evidence.map(e => ({ source: e.source, type: e.type, weight: e.weight })),
-                flutter: info.flutter,
-                compose: info.compose,
-                webview: info.webview,
-                cached: true,
-              }),
-            }],
-          };
-        }
-        const detector = createArchitectureDetector();
-        const info = await detector.detect({ traceId, traceProcessorService, packageName });
+        const payload = await detectArchitecturePayload();
         return {
           content: [{
             type: 'text' as const,
             text: JSON.stringify({
-              type: info.type,
-              confidence: info.confidence,
-              evidence: info.evidence.map(e => ({ source: e.source, type: e.type, weight: e.weight })),
-              flutter: info.flutter,
-              compose: info.compose,
-              webview: info.webview,
+              ...payload,
+              sourceToolCallId: producer.sourceToolCallId,
+              paramsHash: producer.paramsHash,
+              planPhaseId: producer.planPhaseId,
             }),
           }],
         };
       } catch (err) {
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: (err as Error).message }) }],
+          content: [{ type: 'text' as const, text: JSON.stringify({
+            success: false,
+            sourceToolCallId: producer.sourceToolCallId,
+            paramsHash: producer.paramsHash,
+            planPhaseId: producer.planPhaseId,
+            error: (err as Error).message,
+          }) }],
           isError: true,
         };
       }
@@ -1226,7 +2160,8 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     'Supports pagination for large datasets — use offset/limit to page through rows without token overflow. ' +
     'Response includes totalRows and hasMore to guide pagination. ALL data is accessible; nothing is hidden.\n\n' +
     'Use when: you need detailed data from a previous invoke_skill result (artifacts are referenced by ID in skill responses).\n' +
-    'Don\'t use when: you need new data (use invoke_skill or execute_sql instead).\n\n' +
+    'Don\'t use when: you need new data (use invoke_skill or execute_sql instead).\n' +
+    'Always set purpose to one short sentence explaining why this artifact is needed for the current plan phase.\n\n' +
     'Examples:\n' +
     '1. Get summary of skill result: artifactId="art-1", detail="summary"\n' +
     '2. Page through jank frames: artifactId="art-2", detail="rows", offset=0, limit=50\n' +
@@ -1236,21 +2171,75 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       detail: z.enum(['summary', 'rows', 'full']).optional().describe(
         'Detail level: summary (default, compact stats), rows (paginated data rows), full (complete original structure — use with caution on large artifacts)'
       ),
-      offset: z.number().optional().describe(
+      offset: z.coerce.number().int().min(0).optional().describe(
         'Row offset for pagination (detail="rows" only). Default: 0. Use with limit to page through large datasets.'
       ),
-      limit: z.number().optional().describe(
+      limit: z.coerce.number().int().min(1).max(200).optional().describe(
         'Maximum rows to return (detail="rows" only). Default: 50. Increase up to 200 if you need more rows per page.'
       ),
+      purpose: z.string().optional().describe(
+        'One short sentence explaining why this artifact is needed for the current plan phase. Used in the user-visible timeline.'
+      ),
     },
-    async ({ artifactId, detail, offset, limit }) => {
+    async ({ artifactId, detail, offset, limit, purpose }) => {
       const effectiveDetail = detail || 'summary';
-      const result = artifactStore.fetch(artifactId, effectiveDetail, offset, limit);
+      const normalizedOffset = coerceOptionalInteger(offset, 'offset', { min: 0 });
+      const normalizedLimit = coerceOptionalInteger(limit, 'limit', { min: 1, max: 200 });
+      const paginationErrors = [normalizedOffset.error, normalizedLimit.error].filter(Boolean);
+      const producerReason = purpose || localize(
+        outputLanguage,
+        '读取前序证据表的明细数据，用于当前阶段判断。',
+        'Read detailed rows from a previous evidence artifact for the current phase.',
+      );
+      if (paginationErrors.length > 0) {
+        const producer = createEvidenceProducerContext(
+          'fetch_artifact',
+          { artifactId, detail: effectiveDetail, offset, limit, purpose },
+          producerReason,
+        );
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({
+            success: false,
+            error: `Invalid pagination arguments: ${paginationErrors.join('; ')}`,
+          }) }],
+          isError: true,
+        };
+      }
+
+      const result = artifactStore.fetch(artifactId, effectiveDetail, normalizedOffset.value, normalizedLimit.value);
+      const originPhase = result?.planPhaseId
+        ? {
+            phaseId: result.planPhaseId,
+            phaseTitle: result.planPhaseTitle,
+            phaseGoal: result.planPhaseGoal,
+            attribution: 'inferred' as const,
+          }
+        : undefined;
+      const producer = createEvidenceProducerContext(
+        'fetch_artifact',
+        {
+          artifactId,
+          detail: effectiveDetail,
+          offset,
+          limit,
+          purpose,
+          artifactPlanPhaseId: result?.planPhaseId,
+          artifactPlanPhaseTitle: result?.planPhaseTitle,
+          artifactTitle: result?.title,
+          artifactStepId: result?.stepId,
+        },
+        producerReason,
+        undefined,
+        originPhase,
+      );
       if (!result) {
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({
             success: false,
             error: `Artifact ${artifactId} not found — it may have been evicted (LRU cap: 50) or lost after a backend restart. Use invoke_skill to re-execute the skill if you need this data again.`,
+            sourceToolCallId: producer.sourceToolCallId,
+            paramsHash: producer.paramsHash,
+            planPhaseId: producer.planPhaseId,
           }) }],
           isError: true,
         };
@@ -1263,7 +2252,19 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       const reminder = (effectiveDetail === 'full' || effectiveDetail === 'rows')
         ? buildActivePhaseReminder(analysisPlanRef?.current, options.sceneType)
         : '';
-      const payload = JSON.stringify({ success: true, detail: effectiveDetail, ...result });
+      const payload = JSON.stringify({
+        success: true,
+        detail: effectiveDetail,
+        ...result,
+        sourceToolCallId: producer.sourceToolCallId,
+        paramsHash: producer.paramsHash,
+        planPhaseId: producer.planPhaseId,
+        planPhaseTitle: producer.planPhaseTitle,
+        planPhaseGoal: producer.planPhaseGoal,
+        planPhaseAttribution: producer.planPhaseAttribution,
+        sourceArtifactId: artifactId,
+        ...(purpose ? { purpose } : {}),
+      });
       return {
         content: [{
           type: 'text' as const,
@@ -1882,9 +2883,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         };
       }
 
-      const waiverInputs = waivers === undefined
-        ? []
-        : parseToolArrayInput<PlanAspectWaiver>(waivers);
+      const waiverInputs = parseOptionalToolArrayInput<PlanAspectWaiver>(waivers);
       if (!waiverInputs) {
         return {
           content: [{
@@ -1898,7 +2897,9 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         };
       }
 
-      const normalizedPhases = phaseInputs.map(normalizePlanPhaseToolInput);
+      const normalizedPhases = moveConclusionPhasesLast(
+        phaseInputs.map(normalizePlanPhaseToolInput),
+      );
 
       // P1-G11: Validate against the scene template, honouring agent waivers.
       const validation = validatePlanAgainstSceneTemplate(normalizedPhases, options.sceneType, waiverInputs);
@@ -2012,7 +3013,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     'When skipping, explain why (e.g. "trace 中无启动数据，跳过启动分析").',
     {
       phaseId: z.string().describe('Phase ID to update (e.g. "p1")'),
-      status: z.enum(['in_progress', 'completed', 'skipped']).describe('New phase status'),
+      status: z.enum(['in_progress', 'completed', 'skipped', 'active']).describe('New phase status. "active" is accepted as an alias for "in_progress".'),
       summary: z.string().optional().describe('REQUIRED for completed/skipped: key evidence or reason. Must include specific data (numbers, names, findings).'),
     },
     async ({ phaseId, status, summary }) => {
@@ -2045,7 +3046,8 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       }
 
       const trimmedSummary = summary?.trim();
-      if ((status === 'completed' || status === 'skipped') &&
+      const normalizedStatus: PlanPhase['status'] = status === 'active' ? 'in_progress' : status;
+      if ((normalizedStatus === 'completed' || normalizedStatus === 'skipped') &&
         (!trimmedSummary || trimmedSummary.length < MIN_PHASE_SUMMARY_CHARS)) {
         return {
           content: [{
@@ -2064,15 +3066,65 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         };
       }
 
-      phase.status = status;
-      if (status === 'completed' || status === 'skipped') {
+      if (normalizedStatus === 'skipped' && isConclusionLikePlanPhase(phase)) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: false,
+              error: localize(
+                outputLanguage,
+                `阶段 ${phaseId} 是最终结论阶段，不能标记为 skipped。请先补齐必要证据，然后将该阶段标记为 completed，并输出最终结论。`,
+                `Phase ${phaseId} is the final conclusion phase and cannot be skipped. Collect the required evidence first, then mark it completed and produce the final conclusion.`,
+              ),
+              action_required: 'complete_final_conclusion_phase',
+              currentPhaseId: phase.id,
+              currentPhaseName: phase.name,
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const semanticMismatch = findPhaseSemanticMismatch(plan, phase, trimmedSummary);
+      if (semanticMismatch) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: false,
+              error: localize(
+                outputLanguage,
+                `阶段 ${phaseId} 是「${phase.name}」，但 summary 更像「${PHASE_SEMANTIC_LABELS[semanticMismatch.summaryKind]}」。请改用阶段 ${semanticMismatch.suggestedPhase.id}（${semanticMismatch.suggestedPhase.name}）或重写 summary。`,
+                `Phase ${phaseId} is "${phase.name}", but the summary looks like "${PHASE_SEMANTIC_LABELS[semanticMismatch.summaryKind]}". Use phase ${semanticMismatch.suggestedPhase.id} (${semanticMismatch.suggestedPhase.name}) or rewrite the summary.`,
+              ),
+              action_required: 'retry_update_plan_phase_with_correct_phase',
+              currentPhaseId: phase.id,
+              currentPhaseName: phase.name,
+              suggestedPhaseId: semanticMismatch.suggestedPhase.id,
+              suggestedPhaseName: semanticMismatch.suggestedPhase.name,
+              detectedSummaryKind: semanticMismatch.summaryKind,
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      if (normalizedStatus === 'in_progress') {
+        closeSupersededInProgressPhases(plan, phase);
+        phase.completedAt = undefined;
+        phase.summary = undefined;
+      }
+
+      phase.status = normalizedStatus;
+      if (normalizedStatus === 'completed' || normalizedStatus === 'skipped') {
         phase.completedAt = Date.now();
         phase.summary = trimmedSummary;
       }
 
       emitUpdate?.({
         type: 'plan_phase_updated',
-        content: { phaseId, status, summary: trimmedSummary || '', phaseName: phase.name },
+        content: { phaseId, status: normalizedStatus, summary: trimmedSummary || '', phaseName: phase.name },
         timestamp: Date.now(),
       });
 
@@ -2087,7 +3139,8 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       // Restatement injection: leverage tool response's high-attention position
       // to re-state next-phase constraints from strategy frontmatter phase_hints.
       // Match logic lives in `phaseHintMatcher` so it can be unit tested.
-      if (nextPhase && options.sceneType) {
+      const shouldReportNextPhase = normalizedStatus === 'completed' || normalizedStatus === 'skipped';
+      if (shouldReportNextPhase && nextPhase && options.sceneType) {
         const hints = getPhaseHints(options.sceneType);
         const matchedHint = matchPhaseHintForNextPhase({
           hints,
@@ -2168,10 +3221,12 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         };
       }
 
-      const normalizedUpdatedPhases = updatedPhaseInputs.map((p): NormalizedPlanPhaseToolInput => ({
-        ...normalizePlanPhaseToolInput(p),
-        status: p.status,
-      }));
+      const normalizedUpdatedPhases = moveConclusionPhasesLast(
+        updatedPhaseInputs.map((p): NormalizedPlanPhaseToolInput => ({
+          ...normalizePlanPhaseToolInput(p),
+          status: p.status,
+        })),
+      );
 
       // Reset submit attempts so a revised plan can trigger hard-gate validation again
       planSubmitAttempts = 0;
@@ -2293,20 +3348,61 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     'Use this when you form a testable theory about the root cause of a performance issue. ' +
     'Every hypothesis MUST be resolved (confirmed/rejected with evidence) before concluding.',
     {
-      statement: z.string().describe(
-        'The hypothesis statement (e.g., "RenderThread is blocked by Binder transactions causing jank frames")'
+      id: z.string().optional().describe('Optional caller-provided hypothesis ID (e.g., "h1"). If omitted, the system assigns one.'),
+      statement: z.string().optional().describe(
+        'The hypothesis statement (e.g., "RenderThread is blocked by Binder transactions causing jank frames"). Alias: title.'
       ),
+      title: z.string().optional().describe('Alias for statement, accepted for Claude SDK argument compatibility.'),
       basis: z.string().optional().describe(
-        'What observation prompted this hypothesis (e.g., "Observed 3 frames with RenderThread in sleeping state")'
+        'What observation prompted this hypothesis (e.g., "Observed 3 frames with RenderThread in sleeping state"). Alias: reasoning.'
       ),
+      reasoning: z.string().optional().describe('Alias for basis, accepted for Claude SDK argument compatibility.'),
     },
-    async ({ statement, basis }) => {
-      hypothesisCounter++;
+    async ({ id, statement, title, basis, reasoning }) => {
+      const effectiveStatement = (statement ?? title)?.trim();
+      const effectiveBasis = (basis ?? reasoning)?.trim();
+      if (!effectiveStatement) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: false,
+              error: 'submit_hypothesis requires statement (or title)',
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const requestedId = id?.trim();
+      const existing = requestedId ? hypothesesRef.find(h => h.id === requestedId) : undefined;
+      if (existing) {
+        if (existing.status === 'formed') {
+          existing.statement = effectiveStatement;
+          existing.basis = effectiveBasis;
+        }
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: true,
+              hypothesisId: existing.id,
+              reused: true,
+            }),
+          }],
+        };
+      }
+
+      const hypothesisId = requestedId || `h${++hypothesisCounter}`;
+      const numericId = /^h(\d+)$/i.exec(hypothesisId);
+      if (numericId) {
+        hypothesisCounter = Math.max(hypothesisCounter, Number(numericId[1]));
+      }
       const hypothesis: Hypothesis = {
-        id: `h${hypothesisCounter}`,
-        statement,
+        id: hypothesisId,
+        statement: effectiveStatement,
         status: 'formed',
-        basis,
+        basis: effectiveBasis,
         formedAt: Date.now(),
       };
       hypothesesRef.push(hypothesis);
@@ -2314,12 +3410,12 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       return {
         content: [{
           type: 'text' as const,
-          text: JSON.stringify({
-            success: true,
-            hypothesisId: hypothesis.id,
-          }),
-        }],
-      };
+            text: JSON.stringify({
+              success: true,
+              hypothesisId,
+            }),
+          }],
+        };
     }
   ) : null;
 
@@ -2329,30 +3425,70 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     'Provide the evidence that supports your conclusion. ' +
     'All hypotheses MUST be resolved before writing your final conclusion.',
     {
-      hypothesisId: z.string().describe('Hypothesis ID to resolve (e.g., "h1")'),
-      status: z.enum(['confirmed', 'rejected']).describe(
-        'Resolution: confirmed (evidence supports) or rejected (evidence contradicts)'
+      hypothesisId: z.string().optional().describe('Hypothesis ID to resolve (e.g., "h1"). Alias: id.'),
+      id: z.string().optional().describe('Alias for hypothesisId, accepted for Claude SDK argument compatibility.'),
+      status: z.enum(['confirmed', 'rejected']).optional().describe(
+        'Resolution: confirmed (evidence supports) or rejected (evidence contradicts). Alias: verdict.'
       ),
+      verdict: z.enum(['confirmed', 'rejected']).optional().describe('Alias for status, accepted for Claude SDK argument compatibility.'),
       evidence: z.string().describe(
         'The evidence supporting this resolution (specific data, timestamps, tool results)'
       ),
     },
-    async ({ hypothesisId, status, evidence }) => {
-      const hypothesis = hypothesesRef.find(h => h.id === hypothesisId);
-      if (!hypothesis) {
+    async ({ hypothesisId, id, status, verdict, evidence }) => {
+      const effectiveHypothesisId = (hypothesisId ?? id)?.trim();
+      const effectiveStatus = status ?? verdict;
+      if (!effectiveHypothesisId || !effectiveStatus) {
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: `Hypothesis "${hypothesisId}" not found` }) }],
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: false,
+              error: 'resolve_hypothesis requires hypothesisId (or id) and status (or verdict)',
+            }),
+          }],
           isError: true,
+        };
+      }
+      const hypothesis = hypothesesRef.find(h => h.id === effectiveHypothesisId);
+      if (!hypothesis) {
+        const now = Date.now();
+        const backfilled: Hypothesis = {
+          id: effectiveHypothesisId,
+          statement: `Backfilled hypothesis ${effectiveHypothesisId}`,
+          status: effectiveStatus,
+          basis: 'resolve_hypothesis was called before submit_hypothesis; preserving the resolution evidence instead of failing the run.',
+          evidence,
+          formedAt: now,
+          resolvedAt: now,
+        };
+        hypothesesRef.push(backfilled);
+        const numericId = /^h(\d+)$/i.exec(effectiveHypothesisId);
+        if (numericId) {
+          hypothesisCounter = Math.max(hypothesisCounter, Number(numericId[1]));
+        }
+        const unresolvedCount = hypothesesRef.filter(h => h.status === 'formed').length;
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: true,
+              hypothesisId: effectiveHypothesisId,
+              status: effectiveStatus,
+              backfilled: true,
+              unresolvedCount,
+            }),
+          }],
         };
       }
       if (hypothesis.status !== 'formed') {
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: `Hypothesis "${hypothesisId}" already resolved as ${hypothesis.status}` }) }],
+          content: [{ type: 'text' as const, text: JSON.stringify({ success: false, error: `Hypothesis "${effectiveHypothesisId}" already resolved as ${hypothesis.status}` }) }],
           isError: true,
         };
       }
 
-      hypothesis.status = status;
+      hypothesis.status = effectiveStatus;
       hypothesis.evidence = evidence;
       hypothesis.resolvedAt = Date.now();
 
@@ -2362,8 +3498,8 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           type: 'text' as const,
           text: JSON.stringify({
             success: true,
-            hypothesisId,
-            status,
+            hypothesisId: effectiveHypothesisId,
+            status: effectiveStatus,
             unresolvedCount,
           }),
         }],
@@ -2517,6 +3653,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     'Use "current" for the primary trace, "reference" for the comparison trace.\n\n' +
     'Use when: you need to drill into a specific trace during comparison analysis, ' +
     'or verify a finding from compare_skill with more targeted SQL.\n\n' +
+    'SQL safety rules: qualify duplicate column names after JOINs. Do not write bare SELECT name/ts/dur when joining slice/thread/process; use s.name AS slice_name, s.ts, s.dur, t.name AS thread_name, p.name AS process_name, or prefer the thread_slice stdlib view. FrameTimeline rows expose upid, not utid/process_name; use JOIN process USING(upid) for actual_frame_timeline_slice. thread_slice does not expose self_dur directly; JOIN slice_self_dur USING(id) when self time is needed. When using thread_slice, read thread_name and process_name directly; do not write t.name or p.name unless JOIN thread t or JOIN process p is present.\n\n' +
     'Examples:\n' +
     '1. Check reference trace jank: trace="reference", sql="SELECT COUNT(*) FROM actual_frame_timeline_slice WHERE jank_type != \'None\'"\n' +
     '2. Compare CPU freq: trace="current", sql="SELECT cpu, AVG(value) as avg_freq FROM counter JOIN counter_track ON counter.track_id=counter_track.id WHERE counter_track.name GLOB \'cpu*freq\' GROUP BY cpu"',
@@ -2538,21 +3675,40 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       const traceLabel = trace === 'reference'
         ? localize(outputLanguage, '[参考 Trace]', '[reference trace]')
         : localize(outputLanguage, '[当前 Trace]', '[current trace]');
+      const producer = createEvidenceProducerContext(
+        'execute_sql_on',
+        { trace, sql, summary },
+        trace === 'reference'
+          ? localize(outputLanguage, '执行参考 Trace SQL，验证对比差异。', 'Run SQL on the reference trace to verify comparison deltas.')
+          : localize(outputLanguage, '执行当前 Trace SQL，验证对比差异。', 'Run SQL on the current trace to verify comparison deltas.'),
+        trace,
+      );
       try {
         const sqlStart = Date.now();
-        const processIdentityWarning = rawSqlProcessIdentityWarning(sql);
-        const { result, finalSql, injected, traceProvenance } = await runRawSqlWithIncludeInjection(
+        const { result, finalSql, injected, traceProvenance, normalizedSql, sqlRewrites } = await runRawSqlWithIncludeInjection(
           targetTraceId,
           sql,
           trace,
         );
+        const processIdentityWarning = rawSqlProcessIdentityWarning(normalizedSql);
         const truncated = result.rows.length > 200;
         const rows = truncated ? result.rows.slice(0, 200) : result.rows;
         const success = !result.error;
+        let emittedEvidence: { evidenceRefId: string; queryHash: string } | undefined;
 
         if (success && summary && result.rows.length > 0) {
           const summaryResult = summarizeSqlResult(result.columns, result.rows);
           const durationMs = Date.now() - sqlStart;
+          if (emitUpdate) {
+            emittedEvidence = emitSqlSummaryDataEnvelope(
+              emitUpdate,
+              summaryResult,
+              finalSql,
+              injected,
+              traceProvenance,
+              producer,
+            );
+          }
           const text = JSON.stringify({
             success: true,
             trace: traceLabel,
@@ -2562,7 +3718,12 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             summary: summaryResult,
             totalRows: result.rows.length,
             durationMs,
+            evidenceRefId: emittedEvidence?.evidenceRefId,
+            sourceToolCallId: producer.sourceToolCallId,
+            paramsHash: producer.paramsHash,
+            planPhaseId: producer.planPhaseId,
             executableSql: finalSql,
+            ...(sqlRewrites.length > 0 ? { sqlRewrites } : {}),
             stdlibInjectedModules: injected,
             ...(processIdentityWarning ? { processIdentityWarning } : {}),
           });
@@ -2570,6 +3731,27 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         }
 
         const durationMs = Date.now() - sqlStart;
+        if (emitUpdate && success && result.columns.length > 0) {
+          emittedEvidence = emitSqlDataEnvelope(
+            emitUpdate,
+            result.columns,
+            rows,
+            finalSql,
+            injected,
+            traceProvenance,
+            producer,
+          );
+        } else if (emitUpdate && !success) {
+          emittedEvidence = emitSqlDiagnosticDataEnvelope(
+            emitUpdate,
+            result.error || localize(outputLanguage, 'SQL 执行失败', 'SQL execution failed'),
+            finalSql,
+            injected,
+            traceProvenance,
+            producer,
+          );
+        }
+
         const text = JSON.stringify({
           success,
           trace: traceLabel,
@@ -2581,7 +3763,12 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           totalRows: result.rows.length,
           truncated,
           durationMs,
+          evidenceRefId: emittedEvidence?.evidenceRefId,
+          sourceToolCallId: producer.sourceToolCallId,
+          paramsHash: producer.paramsHash,
+          planPhaseId: producer.planPhaseId,
           executableSql: finalSql,
+          ...(sqlRewrites.length > 0 ? { sqlRewrites } : {}),
           stdlibInjectedModules: injected,
           ...(processIdentityWarning ? { processIdentityWarning } : {}),
           error: result.error,
@@ -2592,6 +3779,15 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           traceId: targetTraceId,
           traceSide: trace,
         });
+        const emittedEvidence = emitUpdate ? emitSqlDiagnosticDataEnvelope(
+          emitUpdate,
+          e.message,
+          sql,
+          undefined,
+          traceProvenance,
+          producer,
+          outputLanguage,
+        ) : undefined;
         return {
           content: [{
             type: 'text' as const,
@@ -2601,6 +3797,10 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
               traceSide: trace,
               traceId: targetTraceId,
               traceProvenance,
+              evidenceRefId: emittedEvidence?.evidenceRefId,
+              sourceToolCallId: producer.sourceToolCallId,
+              paramsHash: producer.paramsHash,
+              planPhaseId: producer.planPhaseId,
               error: e.message,
             }),
           }],
@@ -2636,6 +3836,11 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         const refParams = comparisonContext?.referencePackageName
           ? normalizeSkillParams(params, comparisonContext.referencePackageName)
           : normalizeSkillParams(params); // No default package — skill runs unfiltered
+        const baseProducer = createEvidenceProducerContext(
+          'compare_skill',
+          { skillId, params },
+          localize(outputLanguage, `对比 Skill ${skillId}，在当前和参考 Trace 上收集同构证据。`, `Compare Skill ${skillId} to collect aligned evidence on current and reference traces.`),
+        );
 
         emitUpdate?.({
           type: 'progress',
@@ -2682,17 +3887,27 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         if (emitUpdate && currentResult.displayResults?.length) {
           emitSkillDataEnvelopes(
             currentResult.displayResults as SkillDisplayResult[],
-            `${skillId}${localize(outputLanguage, '[当前]', '[current]')}`,
+            skillId,
             emitUpdate,
             currentTraceProvenance,
+            {
+              ...baseProducer,
+              sourceToolCallId: `${baseProducer.sourceToolCallId}:current`,
+              producerReason: localize(outputLanguage, `当前 Trace 对比 Skill ${skillId} 结果。`, `Current trace result for comparison Skill ${skillId}.`),
+            },
           );
         }
         if (emitUpdate && refResult.displayResults?.length) {
           emitSkillDataEnvelopes(
             refResult.displayResults as SkillDisplayResult[],
-            `${skillId}${localize(outputLanguage, '[参考]', '[reference]')}`,
+            skillId,
             emitUpdate,
             referenceTraceProvenance,
+            {
+              ...baseProducer,
+              sourceToolCallId: `${baseProducer.sourceToolCallId}:reference`,
+              producerReason: localize(outputLanguage, `参考 Trace 对比 Skill ${skillId} 结果。`, `Reference trace result for comparison Skill ${skillId}.`),
+            },
           );
         }
 
@@ -2839,6 +4054,129 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
   };
 }
 
+function evidenceHash(input: unknown): string {
+  const text = typeof input === 'string'
+    ? input
+    : JSON.stringify(input, (_key, value) => typeof value === 'bigint' ? value.toString() : value);
+  return createHash('sha256').update(text || '').digest('hex').slice(0, 12);
+}
+
+function evidencePart(value: unknown, fallback = 'unknown'): string {
+  const text = String(value ?? fallback)
+    .trim()
+    .replace(/[^a-zA-Z0-9_.-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 80);
+  return text || fallback;
+}
+
+function evidenceTracePart(traceProvenance?: TraceProcessorQueryProvenance): string {
+  if (!traceProvenance) return 'trace_unknown';
+  const side = evidencePart(traceProvenance.traceSide || 'current', 'current');
+  const trace = evidenceHash(traceProvenance.traceId);
+  return `${side}:${trace}`;
+}
+
+interface EvidenceProducerContext {
+  sourceToolCallId?: string;
+  paramsHash?: string;
+  planPhaseId?: string;
+  planPhaseTitle?: string;
+  planPhaseGoal?: string;
+  planPhaseAttribution?: 'active' | 'inferred' | 'missing' | 'ambiguous' | 'unexpected_tool' | 'none';
+  planPhaseWarning?: string;
+  toolNarration?: string;
+  producerReason?: string;
+}
+
+function stableSqlEvidenceRefId(
+  sql: string | undefined,
+  columns: string[],
+  rows: any[],
+  traceProvenance?: TraceProcessorQueryProvenance,
+  producer?: EvidenceProducerContext,
+  mode: 'table' | 'summary' | 'diagnostic' = 'table',
+): { evidenceRefId: string; queryHash: string } {
+  const queryHash = evidenceHash(sql || { columns, sampleRows: rows.slice(0, 5), rowCount: rows.length });
+  const toolPart = evidencePart(producer?.paramsHash || 'tool', 'tool');
+  return {
+    evidenceRefId: `data:sql_${mode}:${evidenceTracePart(traceProvenance)}:${queryHash}:${toolPart}`,
+    queryHash,
+  };
+}
+
+function stableSkillEvidenceRefId(
+  skillId: string,
+  stepId: string | undefined,
+  title: string | undefined,
+  data: unknown,
+  traceProvenance?: TraceProcessorQueryProvenance,
+  producer?: EvidenceProducerContext,
+): string {
+  const dataHash = evidenceHash({
+    title,
+    data,
+  });
+  const toolPart = evidencePart(producer?.paramsHash || 'tool', 'tool');
+  return `data:skill:${evidencePart(skillId, 'skill')}:${evidencePart(stepId || title, 'step')}:${evidenceTracePart(traceProvenance)}:${dataHash}:${toolPart}`;
+}
+
+function sqlSummaryMarkdown(summary: SqlSummary): string {
+  const stats = Array.isArray(summary.columnStats) ? summary.columnStats : [];
+  const lines = [
+    `Total rows: ${summary.totalRows}`,
+    '',
+    '| Column | Type | Min | Avg | P95 | Max | Nulls |',
+    '| --- | --- | ---: | ---: | ---: | ---: | ---: |',
+  ];
+  for (const stat of stats.slice(0, 20)) {
+    lines.push([
+      stat.column,
+      stat.type,
+      stat.min ?? '',
+      stat.avg ?? '',
+      stat.p95 ?? '',
+      stat.max ?? '',
+      stat.nullCount,
+    ].join(' | '));
+  }
+  return lines.join('\n');
+}
+
+function sqlSummaryMetrics(summary: SqlSummary): Array<{
+  label: string;
+  value: string | number;
+  severity?: 'info' | 'warning' | 'critical';
+}> {
+  const metrics: Array<{ label: string; value: string | number; severity?: 'info' | 'warning' | 'critical' }> = [
+    { label: 'total_rows', value: summary.totalRows, severity: 'info' },
+  ];
+  const stats = Array.isArray(summary.columnStats) ? summary.columnStats : [];
+  for (const stat of stats.slice(0, 8)) {
+    if (stat.type !== 'numeric') continue;
+    if (stat.avg !== undefined) metrics.push({ label: `${stat.column}.avg`, value: stat.avg, severity: 'info' });
+    if (stat.p95 !== undefined) metrics.push({ label: `${stat.column}.p95`, value: stat.p95, severity: 'info' });
+  }
+  return metrics;
+}
+
+function producerEnvelopeOptions(producer?: EvidenceProducerContext): Pick<
+  Parameters<typeof createDataEnvelope>[1],
+  'sourceToolCallId' | 'paramsHash' | 'planPhaseId' | 'planPhaseTitle' | 'planPhaseGoal' | 'planPhaseAttribution' | 'planPhaseWarning' | 'toolNarration' | 'producerReason'
+> {
+  return {
+    sourceToolCallId: producer?.sourceToolCallId,
+    paramsHash: producer?.paramsHash,
+    planPhaseId: producer?.planPhaseId,
+    planPhaseTitle: producer?.planPhaseTitle,
+    planPhaseGoal: producer?.planPhaseGoal,
+    planPhaseAttribution: producer?.planPhaseAttribution,
+    planPhaseWarning: producer?.planPhaseWarning,
+    toolNarration: producer?.toolNarration,
+    producerReason: producer?.producerReason,
+  };
+}
+
 /** Emit a DataEnvelope for SQL query results. */
 function emitSqlDataEnvelope(
   emit: (update: StreamingUpdate) => void,
@@ -2847,12 +4185,34 @@ function emitSqlDataEnvelope(
   sql?: string,
   stdlibInjectedModules?: string[],
   traceProvenance?: TraceProcessorQueryProvenance,
-): void {
+  producer?: EvidenceProducerContext,
+): { evidenceRefId: string; queryHash: string } {
+  const { evidenceRefId, queryHash } = stableSqlEvidenceRefId(sql, columns, rows, traceProvenance, producer);
+  const envelope = createDataEnvelope(
+    { columns, rows },
+    {
+      type: 'sql_result',
+      source: 'execute_sql',
+      title: `SQL Query (${rows.length} rows)`,
+      layer: 'list',
+      format: 'table',
+      columns: columns.map((col: string) => ({
+        name: col,
+        type: inferSqlColumnType(col),
+      })),
+      evidenceRefId,
+      traceSide: traceProvenance?.traceSide,
+      traceId: traceProvenance?.traceId,
+      queryHash,
+      ...producerEnvelopeOptions(producer),
+      intent: 'ad_hoc_sql_verification',
+    },
+  );
+
   emit({
     type: 'data',
     content: [{
-      meta: { type: 'sql_result', version: '2.0', source: 'execute_sql' },
-      data: { columns, rows },
+      ...envelope,
       ...(sql ? { sql } : {}),
       ...(stdlibInjectedModules?.length ? { stdlibInjectedModules } : {}),
       ...(traceProvenance ? {
@@ -2860,21 +4220,129 @@ function emitSqlDataEnvelope(
         traceId: traceProvenance.traceId,
         traceProvenance,
       } : {}),
-      display: {
-        layer: 'list',
-        format: 'table',
-        title: `SQL Query (${rows.length} rows)`,
-        columns: columns.map((col: string) => ({
-          name: col,
-          type: inferSqlColumnType(col),
-        })),
-      },
     }],
     timestamp: Date.now(),
   });
+  return { evidenceRefId, queryHash };
 }
 
-function inferSqlColumnType(col: string): string {
+/** Emit a DataEnvelope for SQL summary-mode results. */
+function emitSqlSummaryDataEnvelope(
+  emit: (update: StreamingUpdate) => void,
+  summary: SqlSummary,
+  sql?: string,
+  stdlibInjectedModules?: string[],
+  traceProvenance?: TraceProcessorQueryProvenance,
+  producer?: EvidenceProducerContext,
+): { evidenceRefId: string; queryHash: string } {
+  const { evidenceRefId, queryHash } = stableSqlEvidenceRefId(
+    sql,
+    summary.columns,
+    summary.sampleRows,
+    traceProvenance,
+    producer,
+    'summary',
+  );
+  const envelope = createDataEnvelope(
+    {
+      summary: {
+        title: `SQL Summary (${summary.totalRows} rows)`,
+        content: sqlSummaryMarkdown(summary),
+        metrics: sqlSummaryMetrics(summary),
+      },
+    },
+    {
+      type: 'sql_result',
+      source: 'execute_sql',
+      title: `SQL Summary (${summary.totalRows} rows)`,
+      layer: 'overview',
+      format: 'summary',
+      evidenceRefId,
+      traceSide: traceProvenance?.traceSide,
+      traceId: traceProvenance?.traceId,
+      queryHash,
+      ...producerEnvelopeOptions(producer),
+      intent: 'ad_hoc_sql_summary',
+    },
+  );
+
+  emit({
+    type: 'data',
+    content: [{
+      ...envelope,
+      ...(sql ? { sql } : {}),
+      ...(stdlibInjectedModules?.length ? { stdlibInjectedModules } : {}),
+      ...(traceProvenance ? {
+        traceSide: traceProvenance.traceSide,
+        traceId: traceProvenance.traceId,
+        traceProvenance,
+      } : {}),
+    }],
+    timestamp: Date.now(),
+  });
+  return { evidenceRefId, queryHash };
+}
+
+/** Emit a diagnostic DataEnvelope for failed SQL so missing tables remain explainable. */
+function emitSqlDiagnosticDataEnvelope(
+  emit: (update: StreamingUpdate) => void,
+  error: string,
+  sql?: string,
+  stdlibInjectedModules?: string[],
+  traceProvenance?: TraceProcessorQueryProvenance,
+  producer?: EvidenceProducerContext,
+  outputLanguage: OutputLanguage = DEFAULT_OUTPUT_LANGUAGE,
+): { evidenceRefId: string; queryHash: string } {
+  const { evidenceRefId, queryHash } = stableSqlEvidenceRefId(
+    sql,
+    [],
+    [[error]],
+    traceProvenance,
+    producer,
+    'diagnostic',
+  );
+  const envelope = createDataEnvelope(
+    {
+      text: [
+        localize(outputLanguage, 'SQL 执行未产出可用表格。', 'SQL execution did not produce a table.'),
+        localize(outputLanguage, '这是一条失败诊断，不是可引用的性能证据；需要修正 SQL 后重试。', 'This is a failure diagnostic, not citable performance evidence; fix the SQL and retry.'),
+        `Error: ${error}`,
+        sql ? `SQL: ${sql}` : '',
+      ].filter(Boolean).join('\n'),
+    },
+    {
+      type: 'diagnostic',
+      source: 'execute_sql',
+      title: localize(outputLanguage, 'SQL 执行诊断', 'SQL diagnostic'),
+      layer: 'diagnosis',
+      format: 'text',
+      evidenceRefId,
+      traceSide: traceProvenance?.traceSide,
+      traceId: traceProvenance?.traceId,
+      queryHash,
+      ...producerEnvelopeOptions(producer),
+      intent: 'ad_hoc_sql_diagnostic',
+    },
+  );
+
+  emit({
+    type: 'data',
+    content: [{
+      ...envelope,
+      ...(sql ? { sql } : {}),
+      ...(stdlibInjectedModules?.length ? { stdlibInjectedModules } : {}),
+      ...(traceProvenance ? {
+        traceSide: traceProvenance.traceSide,
+        traceId: traceProvenance.traceId,
+        traceProvenance,
+      } : {}),
+    }],
+    timestamp: Date.now(),
+  });
+  return { evidenceRefId, queryHash };
+}
+
+function inferSqlColumnType(col: string): 'timestamp' | 'duration' | 'percentage' | 'string' {
   if (col.includes('ts') || col.includes('timestamp')) return 'timestamp';
   if (col.includes('dur')) return 'duration';
   if (col.includes('pct') || col.includes('percent')) return 'percentage';
@@ -2890,20 +4358,40 @@ function emitSkillDataEnvelopes(
   skillId: string,
   emit: (update: StreamingUpdate) => void,
   traceProvenance?: TraceProcessorQueryProvenance,
+  producer?: EvidenceProducerContext,
 ): void {
   const envelopes = displayResults
-    .filter(dr => dr.data?.rows?.length)
+    .filter(dr => Array.isArray(dr.data?.rows))
     .map(dr => {
       const explicitColumns = (dr as any).columnDefinitions;
       const envelope = displayResultToEnvelope(dr as any, skillId, explicitColumns);
+      const evidenceRefId = stableSkillEvidenceRefId(
+        skillId,
+        envelope.meta.stepId,
+        envelope.display.title,
+        envelope.data,
+        traceProvenance,
+        producer,
+      );
+      const withEvidence = {
+        ...envelope,
+        meta: {
+          ...envelope.meta,
+          evidenceRefId,
+          traceSide: traceProvenance?.traceSide,
+          traceId: traceProvenance?.traceId,
+          ...producerEnvelopeOptions(producer),
+          intent: 'skill_structured_result',
+        },
+      };
       return traceProvenance
         ? {
-          ...envelope,
+          ...withEvidence,
           traceSide: traceProvenance.traceSide,
           traceId: traceProvenance.traceId,
           traceProvenance,
         }
-        : envelope;
+        : withEvidence;
     });
 
   if (envelopes.length > 0) {

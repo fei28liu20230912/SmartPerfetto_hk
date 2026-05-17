@@ -35,6 +35,23 @@ export interface ConclusionContractEvidenceItem {
   text: string;
 }
 
+export interface ConclusionContractClaimReference {
+  evidenceRefId: string;
+  rowIndex?: number;
+  rowSelector?: Record<string, string | number | boolean>;
+  column?: string;
+  value?: string | number | boolean;
+  sourceRef?: string;
+  sourceToolCallId?: string;
+}
+
+export interface ConclusionContractClaimItem {
+  id?: string;
+  conclusionId?: string;
+  text: string;
+  references: ConclusionContractClaimReference[];
+}
+
 export interface ConclusionContractMetadata {
   confidencePercent?: number;
   rounds?: number;
@@ -48,6 +65,7 @@ export interface ConclusionContract {
   conclusions: ConclusionContractConclusionItem[];
   clusters: ConclusionContractClusterItem[];
   evidenceChain: ConclusionContractEvidenceItem[];
+  claims?: ConclusionContractClaimItem[];
   uncertainties: string[];
   nextSteps: string[];
   metadata?: ConclusionContractMetadata;

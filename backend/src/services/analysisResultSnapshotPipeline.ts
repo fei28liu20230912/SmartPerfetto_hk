@@ -29,6 +29,7 @@ export interface CompletedAnalysisSnapshotInput {
   query: string;
   traceLabel?: string;
   conclusion?: string;
+  conclusionContract?: unknown;
   confidence?: number;
   partial?: boolean;
   terminationReason?: string;
@@ -63,6 +64,137 @@ function firstNonEmptyLine(text: string | undefined): string | undefined {
     .find(Boolean);
 }
 
+function stableEnvelopeContentHash(env: DataEnvelope): string {
+  return crypto.createHash('sha256')
+    .update(JSON.stringify({
+      source: env.meta?.source,
+      skillId: env.meta?.skillId,
+      stepId: env.meta?.stepId,
+      title: env.display?.title,
+      data: env.data,
+    }, (_key, value) => typeof value === 'bigint' ? value.toString() : value))
+    .digest('hex')
+    .slice(0, 12);
+}
+
+function envelopeTraceValue(
+  env: DataEnvelope,
+  key: 'traceSide' | 'traceId',
+): string | undefined {
+  const envelopeAny = env as any;
+  const metaValue = env.meta?.[key];
+  if (typeof metaValue === 'string' && metaValue.length > 0) return metaValue;
+  const topLevelValue = envelopeAny?.[key];
+  if (typeof topLevelValue === 'string' && topLevelValue.length > 0) return topLevelValue;
+  const provenanceValue = envelopeAny?.traceProvenance?.[key];
+  return typeof provenanceValue === 'string' && provenanceValue.length > 0
+    ? provenanceValue
+    : undefined;
+}
+
+function dataEnvelopeRefId(env: DataEnvelope, duplicateEvidenceRefIds: Set<string> = new Set()): string {
+  if (env.meta?.evidenceRefId) {
+    if (duplicateEvidenceRefIds.has(env.meta.evidenceRefId) && env.meta.sourceToolCallId) {
+      return `${env.meta.evidenceRefId}:tool:${env.meta.sourceToolCallId}`;
+    }
+    return env.meta.evidenceRefId;
+  }
+  const source = env.meta?.source || env.meta?.skillId || 'data_envelope';
+  const stepId = env.meta?.stepId || 'step';
+  const timestamp = env.meta?.timestamp;
+  if (typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0) {
+    return `data:${source}:${stepId}:${timestamp}`;
+  }
+  return `data:${source}:${stepId}:${stableEnvelopeContentHash(env)}`;
+}
+
+function toPlainRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function readAliasedValue(record: Record<string, unknown>, aliases: string[]): unknown {
+  for (const alias of aliases) {
+    if (record[alias] !== undefined) return record[alias];
+  }
+  return undefined;
+}
+
+function readAliasedRecordArray(record: Record<string, unknown>, aliases: string[]): Record<string, unknown>[] {
+  const value = readAliasedValue(record, aliases);
+  return Array.isArray(value)
+    ? value.map(toPlainRecord).filter((item): item is Record<string, unknown> => Boolean(item))
+    : [];
+}
+
+function readAliasedString(record: Record<string, unknown>, aliases: string[]): string | undefined {
+  const value = readAliasedValue(record, aliases);
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeClaimSourceRef(value: string): string {
+  const text = String(value || '').trim();
+  const chinese = text.match(/^(?:数据)?(表|摘要|指标|图|图表|文本|时间线)\s*([0-9]+)$/);
+  if (chinese) {
+    const prefixMap: Record<string, string> = {
+      表: 'table',
+      摘要: 'summary',
+      指标: 'metric',
+      图: 'chart',
+      图表: 'chart',
+      文本: 'text',
+      时间线: 'timeline',
+    };
+    return `${prefixMap[chinese[1]]}:${Number(chinese[2])}`;
+  }
+  const english = text.match(/^(?:data\s*)?(table|summary|metric|chart|figure|text|timeline)\s*([0-9]+)$/i);
+  if (english) {
+    const kind = english[1].toLowerCase() === 'figure' ? 'chart' : english[1].toLowerCase();
+    return `${kind}:${Number(english[2])}`;
+  }
+  return text.toLowerCase();
+}
+
+function dataEnvelopeSourceRefKind(env: DataEnvelope): string {
+  const format = env.display?.format;
+  if (format === 'summary') return 'summary';
+  if (format === 'metric') return 'metric';
+  if (format === 'chart') return 'chart';
+  if (format === 'text') return 'text';
+  if (format === 'timeline') return 'timeline';
+  return 'table';
+}
+
+function collectClaimReferencePins(contract: unknown): {
+  evidenceRefIds: Set<string>;
+  sourceToolCallIds: Set<string>;
+  sourceRefs: Set<string>;
+} {
+  const evidenceRefIds = new Set<string>();
+  const sourceToolCallIds = new Set<string>();
+  const sourceRefs = new Set<string>();
+  const root = toPlainRecord(contract);
+  if (!root) return { evidenceRefIds, sourceToolCallIds, sourceRefs };
+
+  const claims = readAliasedRecordArray(root, ['claims', 'claim_refs', 'claimRefs', 'claimReferences', '逐句数据引用']);
+  for (const claim of claims) {
+    const references = readAliasedRecordArray(claim, ['references', 'refs', 'evidenceRefs', 'evidence_refs']);
+    for (const ref of references) {
+      const evidenceRefId = readAliasedString(ref, ['evidenceRefId', 'evidence_ref_id', 'evidenceId', 'evidence_id']);
+      const sourceToolCallId = readAliasedString(ref, [
+        'sourceToolCallId', 'source_tool_call_id', 'toolCallId', 'tool_call_id',
+      ]);
+      const sourceRef = readAliasedString(ref, ['sourceRef', 'source_ref']);
+      if (evidenceRefId) evidenceRefIds.add(evidenceRefId);
+      if (sourceToolCallId) sourceToolCallIds.add(sourceToolCallId);
+      if (sourceRef) sourceRefs.add(normalizeClaimSourceRef(sourceRef));
+    }
+  }
+
+  return { evidenceRefIds, sourceToolCallIds, sourceRefs };
+}
+
 function evidenceRefsFromInput(input: CompletedAnalysisSnapshotInput): EvidenceRef[] {
   const refs: EvidenceRef[] = [];
   if (input.reportId) {
@@ -77,10 +209,33 @@ function evidenceRefsFromInput(input: CompletedAnalysisSnapshotInput): EvidenceR
   }
 
   const seen = new Set<string>();
-  for (const env of (input.dataEnvelopes || []).slice(0, 100)) {
+  const claimPins = collectClaimReferencePins(input.conclusionContract);
+  const dataEnvelopes = input.dataEnvelopes || [];
+  const sourceRefOrdinals: Record<string, number> = {};
+  const evidenceRefCounts = new Map<string, number>();
+  for (const env of dataEnvelopes) {
+    if (!env.meta?.evidenceRefId) continue;
+    evidenceRefCounts.set(env.meta.evidenceRefId, (evidenceRefCounts.get(env.meta.evidenceRefId) || 0) + 1);
+  }
+  const duplicateEvidenceRefIds = new Set(
+    [...evidenceRefCounts.entries()]
+      .filter(([, count]) => count > 1)
+      .map(([id]) => id)
+  );
+  for (let index = 0; index < dataEnvelopes.length; index++) {
+    const env = dataEnvelopes[index];
+    const sourceRefKind = dataEnvelopeSourceRefKind(env);
+    sourceRefOrdinals[sourceRefKind] = (sourceRefOrdinals[sourceRefKind] || 0) + 1;
+    const sourceRefKey = `${sourceRefKind}:${sourceRefOrdinals[sourceRefKind]}`;
     const source = env.meta?.source || env.meta?.skillId || 'data_envelope';
     const stepId = env.meta?.stepId || 'step';
-    const id = `data:${source}:${stepId}:${env.meta?.timestamp || 0}`;
+    const id = dataEnvelopeRefId(env, duplicateEvidenceRefIds);
+    const isPinnedClaimRef =
+      claimPins.evidenceRefIds.has(id) ||
+      (env.meta?.evidenceRefId ? claimPins.evidenceRefIds.has(env.meta.evidenceRefId) : false) ||
+      (env.meta?.sourceToolCallId ? claimPins.sourceToolCallIds.has(env.meta.sourceToolCallId) : false) ||
+      claimPins.sourceRefs.has(sourceRefKey);
+    if (index >= 100 && !isPinnedClaimRef) continue;
     if (seen.has(id)) continue;
     seen.add(id);
     refs.push({
@@ -93,18 +248,23 @@ function evidenceRefsFromInput(input: CompletedAnalysisSnapshotInput): EvidenceR
         source,
         skillId: env.meta?.skillId,
         stepId: env.meta?.stepId,
+        evidenceRefId: env.meta?.evidenceRefId,
+        traceSide: envelopeTraceValue(env, 'traceSide'),
+        traceId: envelopeTraceValue(env, 'traceId'),
+        queryHash: env.meta?.queryHash,
+        sourceToolCallId: env.meta?.sourceToolCallId,
+        paramsHash: env.meta?.paramsHash,
+        planPhaseId: env.meta?.planPhaseId,
+        planPhaseTitle: env.meta?.planPhaseTitle,
+        planPhaseGoal: env.meta?.planPhaseGoal,
+        toolNarration: env.meta?.toolNarration,
+        producerReason: env.meta?.producerReason,
         displayLayer: env.display?.layer,
         displayFormat: env.display?.format,
       },
     });
   }
   return refs;
-}
-
-function dataEnvelopeRefId(env: DataEnvelope): string {
-  const source = env.meta?.source || env.meta?.skillId || 'data_envelope';
-  const stepId = env.meta?.stepId || 'step';
-  return `data:${source}:${stepId}:${env.meta?.timestamp || 0}`;
 }
 
 function payloadRows(env: DataEnvelope): Array<Record<string, unknown>> {
@@ -279,6 +439,7 @@ export function buildCompletedAnalysisResultSnapshot(
       ...(input.confidence !== undefined ? { confidence: input.confidence } : {}),
       ...(partialReasons.length > 0 ? { partialReasons } : {}),
     },
+    ...(input.conclusionContract ? { conclusionContract: input.conclusionContract } : {}),
     metrics,
     evidenceRefs: evidenceRefsFromInput(input),
     status: input.partial || metrics.length === 0 ? 'partial' : 'ready',

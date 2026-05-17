@@ -54,6 +54,11 @@ phase_hints:
     constraints: '冷启动必须调用 startup_slow_reasons 检查 DEX2OAT/baseline profile/debuggable 等官方因素。Q4(Sleeping) >25% 必须用 blocking_chain_analysis 追踪阻塞源。'
     critical_tools: ['startup_slow_reasons', 'blocking_chain_analysis']
     critical: true
+  - id: webview_startup
+    keywords: ['webview', 'chromium', 'v8', 'crrenderermain', 'parsehtml', 'drawgl', '页面渲染', 'WebView启动']
+    constraints: '仅在架构检测或 trace 证据提示 WebView 时执行。SQL 必须说明正在验证 WebView/Chromium/V8/CrRendererMain 是否参与启动；若未命中 slice，应把 WebView 启动影响标为证据不足或可排除，而不是继续归到综合结论。'
+    critical_tools: ['execute_sql']
+    critical: false
   - id: startup_power_overlay
     keywords: ['power', 'battery', 'wattson', '功耗', '耗电', '电池', '启动期能耗', '掉电']
     constraints: '用户关心启动功耗/耗电时，先检查 Trace 数据完整度中的 power_rails、battery_counters、cpu_freq_idle、gpu_work_period。数据可用才调用 wattson_app_startup_power；缺失时输出采集建议，禁止把空表解释为低功耗。'
@@ -117,7 +122,7 @@ invoke_skill("startup_analysis", { enable_startup_details: false })
 ⚠️ **数据质量门禁特别注意：**
 - **R008_TTID_GT_DUR**（TTID > 启动时长）：不要只说"TTID 不可信"或"建议在 Perfetto UI 中查看"——必须**主动分析**差值（TTID - dur_ms）去向。**具体做法**：用 execute_sql 查询启动 end_ts 到 TTID 时间点之间的 RenderThread 和 SurfaceFlinger 活动：
   ```sql
-  SELECT name, dur/1e6 as dur_ms, ts FROM thread_slice
+  SELECT name AS slice_name, dur / 1e6 AS dur_ms, ts FROM thread_slice
   WHERE thread_name IN ('RenderThread', 'GPU completion')
     AND ts BETWEEN <end_ts> AND <end_ts + gap_ns>
     AND process_name GLOB '<package>*'
@@ -352,16 +357,13 @@ invoke_skill("blocking_chain_analysis", { start_ts: "<slice_start>", end_ts: "<s
 首帧显示（TTID）后，App 可能仍在执行异步数据加载、首屏动画、权限检查等操作，导致"看到了但用不了"。
 
 ```sql
-SELECT name, dur/1e6 as dur_ms, t.name as thread
-FROM slice s
-JOIN thread_track tt ON s.track_id = tt.id
-JOIN thread t ON tt.utid = t.utid
-JOIN process p ON t.upid = p.upid
-WHERE p.name GLOB '{process_name}*'
-  AND (t.is_main_thread = 1 OR t.name = 'RenderThread')
-  AND s.ts BETWEEN {end_ts} AND {end_ts} + 500000000
-  AND s.dur > 5000000
-ORDER BY s.dur DESC LIMIT 15
+SELECT name AS slice_name, dur / 1e6 AS dur_ms, thread_name
+FROM thread_slice
+WHERE process_name GLOB '{process_name}*'
+  AND (is_main_thread = 1 OR thread_name = 'RenderThread')
+  AND ts BETWEEN {end_ts} AND {end_ts} + 500000000
+  AND dur > 5000000
+ORDER BY dur DESC LIMIT 15
 ```
 
 关注：网络请求回调、数据库查询、图片异步加载完成后的 UI 刷新、权限弹窗阻塞。
@@ -375,7 +377,7 @@ ORDER BY s.dur DESC LIMIT 15
 
 **Compose 启动 hotspot 检查：**
 ```
-execute_sql("SELECT name, dur/1e6 as dur_ms FROM slice s JOIN thread_track tt ON s.track_id = tt.id JOIN thread t ON tt.utid = t.utid JOIN process p ON t.upid = p.upid WHERE (t.is_main_thread = 1) AND s.ts >= <startup_ts> AND s.ts < <startup_end_ts> AND (s.name GLOB 'Compose:*' OR s.name GLOB 'Recompos*' OR s.name GLOB '*CompositionLocal*' OR s.name GLOB '*LazyList*') ORDER BY dur DESC LIMIT 20")
+execute_sql("SELECT name AS slice_name, dur / 1e6 AS dur_ms, thread_name FROM thread_slice WHERE process_name GLOB '<package>*' AND is_main_thread = 1 AND ts >= <startup_ts> AND ts < <startup_end_ts> AND (name GLOB 'Compose:*' OR name GLOB 'Recompos*' OR name GLOB '*CompositionLocal*' OR name GLOB '*LazyList*') ORDER BY dur DESC LIMIT 20")
 ```
 
 - 如果存在大量 `Recomposition` slice → 检查是否有不必要的重组（state reads 过多）
@@ -400,7 +402,7 @@ Flutter 冷启动包含独特的双线程初始化模型：
 3. 主线程阻塞分析仍适用于 Android 层面；Dart 层面的瓶颈需检查 1.ui 线程的 slice
 
 ```
-execute_sql("SELECT name, dur/1e6 as dur_ms, track_id FROM slice s JOIN thread_track tt ON s.track_id = tt.id JOIN thread t ON tt.utid = t.utid JOIN process p ON t.upid = p.upid WHERE t.name IN ('1.ui', '1.raster') AND s.ts >= <startup_ts> AND s.ts < <startup_end_ts> AND (s.name GLOB '*Framework*BeginFrame*' OR s.name GLOB '*Shell*' OR s.name GLOB '*Engine*Run*' OR s.name GLOB '*DartIsolate*') ORDER BY s.ts LIMIT 20")
+execute_sql("SELECT name AS slice_name, dur / 1e6 AS dur_ms, thread_name, track_id FROM thread_slice WHERE thread_name IN ('1.ui', '1.raster') AND ts >= <startup_ts> AND ts < <startup_end_ts> AND (name GLOB '*Framework*BeginFrame*' OR name GLOB '*Shell*' OR name GLOB '*Engine*Run*' OR name GLOB '*DartIsolate*') ORDER BY ts LIMIT 20")
 ```
 
 **Phase 2.10 — WebView 启动特殊处理（当架构检测为 WebView 时）：**
@@ -422,7 +424,7 @@ WebView 冷启动包含 Chromium 渲染引擎的初始化：
 4. 网络请求耗时通常不在 trace 中体现，需结合 TTFD 分析
 
 ```
-execute_sql("SELECT name, dur/1e6 as dur_ms FROM slice s JOIN thread_track tt ON s.track_id = tt.id JOIN thread t ON tt.utid = t.utid JOIN process p ON t.upid = p.upid WHERE s.ts >= <startup_ts> AND s.ts < <startup_end_ts> AND (s.name GLOB '*WebViewChromium*' OR s.name GLOB '*v8.*' OR t.name = 'CrRendererMain' OR s.name GLOB '*ParseHTML*' OR s.name GLOB '*Layout*') ORDER BY dur DESC LIMIT 20")
+execute_sql("SELECT name AS slice_name, dur / 1e6 AS dur_ms, thread_name FROM thread_slice WHERE process_name GLOB '<package>*' AND ts >= <startup_ts> AND ts < <startup_end_ts> AND (name GLOB '*WebViewChromium*' OR name GLOB '*v8.*' OR thread_name = 'CrRendererMain' OR name GLOB '*ParseHTML*' OR name GLOB '*Layout*' OR name GLOB '*DrawGL*' OR name GLOB '*WebView*') ORDER BY dur DESC LIMIT 20")
 ```
 
 **Phase 3 — 综合结论（基于根因诊断决策树，⚠️ 必须输出完整结构化报告）：**
@@ -566,7 +568,7 @@ TTID 和 TTFD 是两个不同的指标，必须区分：
 - `ttfd_ms` 存在且 > `ttid_ms`（或 > `dur_ms`）→ 应用在首帧后仍有异步内容加载。注意：前面所有 Phase 的查询边界固定在 `start_ts ~ end_ts`，不覆盖首帧之后的时间段。分析 TTID→TTFD 的耗时去向需追加查询：
   ```sql
   -- 查询首帧后到 TTFD 之间的主线程活动
-  SELECT name, dur/1e6 as dur_ms FROM thread_slice
+  SELECT name AS slice_name, dur / 1e6 AS dur_ms FROM thread_slice
   WHERE thread_name IN ('main', 'RenderThread')
     AND ts BETWEEN <end_ts> AND <start_ts + ttfd_ns>
     AND process_name GLOB '<package>*'

@@ -139,14 +139,14 @@ async function analyzeComprehensive() {
   try {
     // Check for scroll-related slice names
     const scrollEvents = await traceProcessor.query(traceId, `
-      SELECT name, COUNT(*) as count
+      SELECT slice.name AS name, COUNT(*) as count
       FROM slice
-      WHERE name GLOB '*scroll*'
-         OR name GLOB '*fling*'
-         OR name GLOB '*touch*'
-         OR name GLOB '*input*'
-         OR name GLOB '*gesture*'
-      GROUP BY name
+      WHERE slice.name GLOB '*scroll*'
+         OR slice.name GLOB '*fling*'
+         OR slice.name GLOB '*touch*'
+         OR slice.name GLOB '*input*'
+         OR slice.name GLOB '*gesture*'
+      GROUP BY slice.name
       ORDER BY count DESC
       LIMIT 10
     `);

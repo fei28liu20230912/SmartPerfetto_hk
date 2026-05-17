@@ -19,7 +19,7 @@ async function runAgentTest() {
 
   const testTracePath = path.join(
     process.cwd(),
-    '../test-traces/app_aosp_scrolling_heavy_jank.pftrace'
+    '../test-traces/scroll-demo-customer-scroll.pftrace'
   );
 
   if (!fs.existsSync(testTracePath)) {

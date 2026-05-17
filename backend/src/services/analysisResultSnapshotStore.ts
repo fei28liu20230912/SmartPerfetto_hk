@@ -41,6 +41,7 @@ interface SnapshotRow {
   trace_label: string;
   trace_metadata_json: string;
   summary_json: string;
+  conclusion_contract_json: string | null;
   status: AnalysisResultSnapshotStatus;
   schema_version: AnalysisResultSnapshot['schemaVersion'];
   created_at: number;
@@ -73,6 +74,7 @@ export interface AnalysisResultSnapshotListFilters {
   visibility?: AnalysisResultVisibility;
   createdBy?: string;
   includeExpired?: boolean;
+  includeConclusionContract?: boolean;
   limit?: number;
 }
 
@@ -90,6 +92,34 @@ function parseJson<T>(value: string, fallback: T): T {
 
 function stringifyJson(value: unknown): string {
   return JSON.stringify(value ?? null);
+}
+
+function snapshotSelectColumns(alias = 's', includeConclusionContract = true): string {
+  const conclusionContractColumn = includeConclusionContract
+    ? `${alias}.conclusion_contract_json`
+    : `NULL AS conclusion_contract_json`;
+  return [
+    `${alias}.id`,
+    `${alias}.tenant_id`,
+    `${alias}.workspace_id`,
+    `${alias}.trace_id`,
+    `${alias}.session_id`,
+    `${alias}.run_id`,
+    `${alias}.report_id`,
+    `${alias}.created_by`,
+    `${alias}.visibility`,
+    `${alias}.scene_type`,
+    `${alias}.title`,
+    `${alias}.user_query`,
+    `${alias}.trace_label`,
+    `${alias}.trace_metadata_json`,
+    `${alias}.summary_json`,
+    conclusionContractColumn,
+    `${alias}.status`,
+    `${alias}.schema_version`,
+    `${alias}.created_at`,
+    `${alias}.expires_at`,
+  ].join(', ');
 }
 
 function metricNumericValue(metric: NormalizedMetricValue): number | null {
@@ -161,6 +191,9 @@ function mapSnapshot(row: SnapshotRow, metrics: NormalizedMetricValue[], evidenc
     traceLabel: row.trace_label,
     traceMetadata: parseJson<TraceComparisonMetadata>(row.trace_metadata_json, {}),
     summary: parseJson<AnalysisSummary>(row.summary_json, { headline: '' }),
+    ...(row.conclusion_contract_json
+      ? { conclusionContract: parseJson<unknown>(row.conclusion_contract_json, undefined) }
+      : {}),
     metrics,
     evidenceRefs,
     status: row.status,
@@ -194,6 +227,19 @@ function mapEvidence(row: EvidenceRow): EvidenceRef {
   };
 }
 
+function evidenceStorageId(
+  snapshotId: string,
+  evidence: EvidenceRef,
+  seen: Map<string, number>,
+): string {
+  const base = evidence.id
+    ? `${snapshotId}:${evidence.id}`
+    : `${snapshotId}:evidence:${crypto.randomUUID()}`;
+  const count = seen.get(base) ?? 0;
+  seen.set(base, count + 1);
+  return count === 0 ? base : `${base}:${count}`;
+}
+
 export class AnalysisResultSnapshotRepository {
   constructor(private readonly db: Database.Database) {}
 
@@ -203,11 +249,11 @@ export class AnalysisResultSnapshotRepository {
         INSERT INTO analysis_result_snapshots
           (id, tenant_id, workspace_id, trace_id, session_id, run_id, report_id, created_by,
            visibility, scene_type, title, user_query, trace_label, trace_metadata_json,
-           summary_json, status, schema_version, created_at, expires_at)
+           summary_json, conclusion_contract_json, status, schema_version, created_at, expires_at)
         VALUES
           (@id, @tenantId, @workspaceId, @traceId, @sessionId, @runId, @reportId, @createdBy,
            @visibility, @sceneType, @title, @userQuery, @traceLabel, @traceMetadataJson,
-           @summaryJson, @status, @schemaVersion, @createdAt, @expiresAt)
+           @summaryJson, @conclusionContractJson, @status, @schemaVersion, @createdAt, @expiresAt)
       `).run({
         id: snapshot.id,
         tenantId: snapshot.tenantId,
@@ -224,6 +270,9 @@ export class AnalysisResultSnapshotRepository {
         traceLabel: snapshot.traceLabel,
         traceMetadataJson: stringifyJson(snapshot.traceMetadata),
         summaryJson: stringifyJson(snapshot.summary),
+        conclusionContractJson: snapshot.conclusionContract === undefined
+          ? null
+          : stringifyJson(snapshot.conclusionContract),
         status: snapshot.status,
         schemaVersion: snapshot.schemaVersion,
         createdAt: snapshot.createdAt,
@@ -262,9 +311,10 @@ export class AnalysisResultSnapshotRepository {
         VALUES
           (@id, @snapshotId, @refType, @refJson, @createdAt)
       `);
+      const evidenceIds = new Map<string, number>();
       for (const evidence of snapshot.evidenceRefs) {
         insertEvidence.run({
-          id: evidence.id || crypto.randomUUID(),
+          id: evidenceStorageId(snapshot.id, evidence, evidenceIds),
           snapshotId: snapshot.id,
           refType: evidence.type,
           refJson: stringifyJson(evidence),
@@ -296,7 +346,7 @@ export class AnalysisResultSnapshotRepository {
   getSnapshot(scope: SnapshotAccessScope, snapshotId: string): AnalysisResultSnapshot | null {
     const where = readableClause(scope);
     const row = this.db.prepare<unknown[], SnapshotRow>(`
-      SELECT s.*
+      SELECT ${snapshotSelectColumns('s', true)}
       FROM analysis_result_snapshots s
       WHERE ${where.sql}
         AND s.id = @snapshotId
@@ -345,7 +395,7 @@ export class AnalysisResultSnapshotRepository {
     }
 
     const rows = this.db.prepare<unknown[], SnapshotRow>(`
-      SELECT s.*
+      SELECT ${snapshotSelectColumns('s', Boolean(filters.includeConclusionContract))}
       FROM analysis_result_snapshots s
       WHERE ${clauses.join(' AND ')}
       ORDER BY s.created_at DESC, s.id DESC
@@ -448,9 +498,10 @@ export class AnalysisResultSnapshotRepository {
         VALUES
           (@id, @snapshotId, @refType, @refJson, @createdAt)
       `);
+      const evidenceIds = new Map<string, number>();
       for (const evidence of evidenceRefs) {
         insertEvidence.run({
-          id: evidence.id || crypto.randomUUID(),
+          id: evidenceStorageId(snapshotId, evidence, evidenceIds),
           snapshotId,
           refType: evidence.type,
           refJson: stringifyJson(evidence),

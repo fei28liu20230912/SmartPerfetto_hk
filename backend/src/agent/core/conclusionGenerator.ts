@@ -20,6 +20,8 @@ import type {
   ConclusionClusterFrameListMode,
   ConclusionClusterOutputMode,
   ConclusionContract,
+  ConclusionContractClaimItem,
+  ConclusionContractClaimReference,
   ConclusionContractClusterItem,
   ConclusionContractClusterPolicy,
   ConclusionContractConclusionItem,
@@ -2067,6 +2069,186 @@ function parseEvidenceItemsFromRecord(record: Record<string, unknown>, fallbackR
   return evidenceTexts.map(text => ({ conclusionId, text }));
 }
 
+function parseClaimScalar(value: unknown): string | number | boolean | undefined {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string') return undefined;
+  const text = String(value).trim();
+  if (!text) return undefined;
+  if (/^(true|false)$/i.test(text)) return /^true$/i.test(text);
+  if (/^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:e[+-]?\d+)?$/i.test(text)) {
+    const parsed = Number(text);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return text;
+}
+
+function parseClaimRowSelector(value: unknown): Record<string, string | number | boolean> | undefined {
+  let record = toRecord(value);
+  if (!record && typeof value === 'string') {
+    const text = value.trim();
+    if (text.startsWith('{')) {
+      try {
+        record = toRecord(JSON.parse(text));
+      } catch {
+        record = null;
+      }
+    } else {
+      const parsed: Record<string, string | number | boolean> = {};
+      for (const part of text.split(/[,，]/)) {
+        const match = part.trim().match(/^([^=：:]+)\s*(?:=|:|：)\s*(.+)$/);
+        if (!match) continue;
+        const key = match[1].trim();
+        const parsedValue = parseClaimScalar(match[2].trim().replace(/^['"]|['"]$/g, ''));
+        if (!key || parsedValue === undefined) continue;
+        parsed[key] = parsedValue;
+      }
+      return Object.keys(parsed).length > 0 ? parsed : undefined;
+    }
+  }
+  if (!record) return undefined;
+
+  const selector: Record<string, string | number | boolean> = {};
+  for (const [key, rawValue] of Object.entries(record)) {
+    const normalizedKey = String(key || '').trim();
+    const parsedValue = parseClaimScalar(rawValue);
+    if (!normalizedKey || parsedValue === undefined) continue;
+    selector[normalizedKey] = parsedValue;
+  }
+  return Object.keys(selector).length > 0 ? selector : undefined;
+}
+
+function parseClaimReferenceFromRecord(record: Record<string, unknown>): ConclusionContractClaimReference | null {
+  const evidenceRefId = String(readValueFromAliases(record, [
+    'evidenceRefId', 'evidence_ref_id', 'evidenceId', 'evidence_id',
+  ]) || '').trim();
+  const sourceRef = String(readValueFromAliases(record, [
+    'sourceRef', 'source_ref', 'ref',
+  ]) || '').trim();
+  const sourceToolCallId = String(readValueFromAliases(record, [
+    'sourceToolCallId', 'source_tool_call_id', 'toolCallId', 'tool_call_id',
+  ]) || '').trim();
+  const rowIndexRaw = readValueFromAliases(record, ['rowIndex', 'row_index']);
+  const rowIndex = parseNumberFromUnknown(rowIndexRaw);
+  const rowSelector = parseClaimRowSelector(readValueFromAliases(record, ['rowSelector', 'row_selector']));
+  const column = String(readValueFromAliases(record, ['column', 'col']) || '').trim();
+  const value = parseClaimScalar(readValueFromAliases(record, ['value']));
+
+  if (!evidenceRefId && !sourceRef && !sourceToolCallId) return null;
+
+  return {
+    evidenceRefId,
+    ...(rowIndex !== undefined ? { rowIndex } : {}),
+    ...(rowSelector ? { rowSelector } : {}),
+    ...(column ? { column } : {}),
+    ...(value !== undefined ? { value } : {}),
+    ...(sourceRef ? { sourceRef } : {}),
+    ...(sourceToolCallId ? { sourceToolCallId } : {}),
+  };
+}
+
+function parseClaimItemsFromUnknown(value: unknown): ConclusionContractClaimItem[] {
+  if (!Array.isArray(value)) return [];
+
+  const claims: ConclusionContractClaimItem[] = [];
+  value.forEach((item, idx) => {
+    const record = toRecord(item);
+    if (!record) return;
+
+    const referencesSource = readValueFromAliases(record, [
+      'references', 'refs', 'evidenceRefs', 'evidence_refs',
+    ]);
+    const references = Array.isArray(referencesSource)
+      ? referencesSource
+          .map(ref => toRecord(ref))
+          .filter((ref): ref is Record<string, unknown> => Boolean(ref))
+          .map(ref => parseClaimReferenceFromRecord(ref))
+          .filter((ref): ref is ConclusionContractClaimReference => Boolean(ref))
+      : [];
+    if (references.length === 0) return;
+
+    const claimId = String(readValueFromAliases(record, ['id', 'claimId', 'claim_id']) || '').trim();
+    const conclusionId = normalizeConclusionId(
+      String(readValueFromAliases(record, ['conclusionId', 'conclusion_id', 'conclusion']) || '').trim(),
+      idx + 1
+    );
+    const text = String(readValueFromAliases(record, ['text', 'statement', 'claim']) || '').trim() || `claim ${idx + 1}`;
+
+    claims.push({
+      ...(claimId ? { id: claimId } : {}),
+      conclusionId,
+      text,
+      references,
+    });
+  });
+  return claims;
+}
+
+function formatClaimReferenceMarkdown(ref: ConclusionContractClaimReference): string {
+  const parts: string[] = [];
+  if (ref.evidenceRefId) parts.push(`evidence_ref_id=${ref.evidenceRefId}`);
+  if (ref.sourceRef) parts.push(`source_ref=${ref.sourceRef}`);
+  if (ref.sourceToolCallId) parts.push(`source_tool_call_id=${ref.sourceToolCallId}`);
+  if (typeof ref.rowIndex === 'number') parts.push(`row_index=${ref.rowIndex}`);
+  if (ref.rowSelector) parts.push(`row_selector=${JSON.stringify(ref.rowSelector)}`);
+  if (ref.column) parts.push(`column=${ref.column}`);
+  if (ref.value !== undefined) parts.push(`value=${String(ref.value)}`);
+  return parts.join('; ');
+}
+
+function parseClaimReferenceFromMarkdownLine(line: string): ConclusionContractClaimReference | null {
+  const record: Record<string, unknown> = {};
+  for (const part of String(line || '').split(';')) {
+    const match = part.trim().match(/^([a-zA-Z_]+)\s*=\s*(.*)$/);
+    if (!match) continue;
+    record[match[1]] = match[2].trim();
+  }
+  return parseClaimReferenceFromRecord(record);
+}
+
+function parseClaimItemsFromMarkdownSection(sectionBody: string): ConclusionContractClaimItem[] {
+  const claims: ConclusionContractClaimItem[] = [];
+  let current: ConclusionContractClaimItem | null = null;
+
+  const flush = () => {
+    if (current && current.references.length > 0) claims.push(current);
+    current = null;
+  };
+
+  for (const rawLine of String(sectionBody || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const claimMatch = line.match(/^[-*]\s+([^:：]+)\s*[:：]\s*(.+)$/);
+    if (claimMatch && !/=/.test(claimMatch[1])) {
+      flush();
+      const idPart = claimMatch[1].trim();
+      const [claimIdRaw, conclusionIdRaw] = idPart.split('/').map(part => part.trim());
+      current = {
+        ...(claimIdRaw ? { id: claimIdRaw } : {}),
+        ...(conclusionIdRaw ? { conclusionId: normalizeConclusionId(conclusionIdRaw, claims.length + 1) } : {}),
+        text: stripBulletPrefix(claimMatch[2].trim()),
+        references: [],
+      };
+      continue;
+    }
+
+    const refLine = line.replace(/^[-*]\s+/, '').trim();
+    const ref = parseClaimReferenceFromMarkdownLine(refLine);
+    if (ref) {
+      if (!current) {
+        current = {
+          id: `Q${claims.length + 1}`,
+          text: `claim ${claims.length + 1}`,
+          references: [],
+        };
+      }
+      current.references.push(ref);
+    }
+  }
+  flush();
+  return claims;
+}
+
 function extractListEntriesFromSectionBody(body: string): string[] {
   const entries: string[] = [];
   for (const rawLine of String(body || '').split(/\r?\n/)) {
@@ -2391,6 +2573,32 @@ function sanitizeConclusionContract(
     .filter(item => item.text)
     .slice(0, 12);
 
+  const claims = (contract.claims || [])
+    .map((item, idx) => {
+      const references = (item.references || [])
+        .map(ref => ({
+          evidenceRefId: sanitizeText(ref.evidenceRefId),
+          ...(typeof ref.rowIndex === 'number' && Number.isFinite(ref.rowIndex) ? { rowIndex: ref.rowIndex } : {}),
+          ...(ref.rowSelector ? { rowSelector: parseClaimRowSelector(ref.rowSelector) } : {}),
+          ...(ref.column ? { column: sanitizeText(ref.column) } : {}),
+          ...(ref.value !== undefined ? { value: parseClaimScalar(ref.value) } : {}),
+          ...(ref.sourceRef ? { sourceRef: sanitizeText(ref.sourceRef) } : {}),
+          ...(ref.sourceToolCallId ? { sourceToolCallId: sanitizeText(ref.sourceToolCallId) } : {}),
+        }))
+        .filter(ref => (
+          (ref.evidenceRefId || ref.sourceRef || ref.sourceToolCallId) &&
+          (ref.value === undefined || typeof ref.value === 'string' || typeof ref.value === 'number' || typeof ref.value === 'boolean')
+        )) as ConclusionContractClaimReference[];
+      return {
+        ...(item.id ? { id: sanitizeText(item.id) } : {}),
+        ...(item.conclusionId ? { conclusionId: normalizeConclusionId(item.conclusionId, idx + 1) } : {}),
+        text: sanitizeText(item.text) || `claim ${idx + 1}`,
+        references,
+      };
+    })
+    .filter(item => item.text && item.references.length > 0)
+    .slice(0, 50);
+
   const uncertainties = dedupe(contract.uncertainties).slice(0, 6);
   const nextSteps = dedupe(contract.nextSteps).slice(0, 6);
 
@@ -2415,6 +2623,7 @@ function sanitizeConclusionContract(
     }],
     clusters,
     evidenceChain,
+    ...(claims.length > 0 ? { claims } : {}),
     uncertainties,
     nextSteps,
     metadata: metadata && (
@@ -2475,6 +2684,20 @@ function renderConclusionContract(
   }
   lines.push('');
 
+  if (contract.claims && contract.claims.length > 0) {
+    lines.push('## 逐句数据引用（结构化来源）');
+    contract.claims.forEach((item, idx) => {
+      const claimId = item.id || `Q${idx + 1}`;
+      const conclusionId = item.conclusionId ? ` / ${item.conclusionId}` : '';
+      lines.push(`- ${claimId}${conclusionId}: ${item.text}`);
+      item.references.forEach((ref) => {
+        const line = formatClaimReferenceMarkdown(ref);
+        if (line) lines.push(`  - ${line}`);
+      });
+    });
+    lines.push('');
+  }
+
   lines.push('## 不确定性与反例');
   if (contract.uncertainties.length === 0) {
     lines.push('- 暂无');
@@ -2520,12 +2743,13 @@ function parseMarkdownToConclusionContract(
     || findMarkdownSection(text, /^##\s*聚类[（(]先看大头[）)]\s*$/m)
     || findMarkdownSection(text, /^##\s*聚类\s*$/m);
   const evidenceSection = findMarkdownSection(text, /^##\s*证据链[（(]对应上述结论[）)]\s*$/m);
+  const claimsSection = findMarkdownSection(text, /^##\s*逐句数据引用(?:[（(](?:结构化来源|系统核对结果)[）)])?\s*$/m);
   const uncertaintySection = findMarkdownSection(text, /^##\s*不确定性与反例\s*$/m);
   const nextStepSection = findMarkdownSection(text, /^##\s*下一步[（(]最高信息增益[）)]\s*$/m);
   const metadataSection = findMarkdownSection(text, /^##\s*分析元数据\s*$/m);
 
   const hasSignal = Boolean(
-    conclusionSection || clusterSection || evidenceSection || uncertaintySection || nextStepSection || metadataSection
+    conclusionSection || clusterSection || evidenceSection || claimsSection || uncertaintySection || nextStepSection || metadataSection
   );
   if (!hasSignal) return null;
 
@@ -2544,6 +2768,7 @@ function parseMarkdownToConclusionContract(
     conclusions: conclusionSection ? parseConclusionItemsFromMarkdownSection(conclusionSection.body) : [],
     clusters: clusterSection ? parseClusterItemsFromMarkdownSection(clusterSection.body) : [],
     evidenceChain: evidenceSection ? parseEvidenceItemsFromMarkdownSection(evidenceSection.body) : [],
+    claims: claimsSection ? parseClaimItemsFromMarkdownSection(claimsSection.body) : [],
     uncertainties: uncertaintySection
       ? extractListEntriesFromSectionBody(uncertaintySection.body).map(normalizeUncertaintyWording)
       : [],
@@ -2580,6 +2805,7 @@ function parseJsonToConclusionContract(
   const conclusionSource = readValueFromAliases(root, ['conclusion', 'conclusions', '结论']);
   const clusterSource = readValueFromAliases(root, ['clusters', 'jank_clusters', '掉帧聚类', 'cluster']);
   const evidenceSource = readValueFromAliases(root, ['evidence_chain', 'evidenceChain', '证据链']);
+  const claimsSource = readValueFromAliases(root, ['claims', 'claim_refs', 'claimRefs', 'claimReferences', '逐句数据引用']);
   const uncertaintySource = readValueFromAliases(root, ['uncertainties', 'uncertainty', '不确定性与反例', '不确定性']);
   const nextStepSource = readValueFromAliases(root, ['next_steps', 'nextStep', 'next_step', '下一步']);
   const metadataSource = readValueFromAliases(root, ['metadata', 'analysis_metadata', '分析元数据']);
@@ -2653,6 +2879,8 @@ function parseJsonToConclusionContract(
     }
   }
 
+  const claims = parseClaimItemsFromUnknown(claimsSource);
+
   const uncertainties = toStringArray(uncertaintySource).map(normalizeUncertaintyWording);
   const nextSteps = toStringArray(nextStepSource).map(normalizeNextStepWording);
 
@@ -2691,6 +2919,7 @@ function parseJsonToConclusionContract(
     conclusions,
     clusters,
     evidenceChain,
+    claims,
     uncertainties,
     nextSteps,
     metadata,
@@ -3425,9 +3654,9 @@ function buildInsightFirstPrompt(params: {
   parts.push(params.scenePromptHints.nextStepLine);
   parts.push('- next_steps 至少 1 条使用固定格式：owner: <负责人>; priority: P0/P1/P2; action: <具体动作>; verification: <验收方式>。');
   parts.push(`- 可给出最多 2 条与“${DEEP_REASON_LABEL}”一一对应的优化方向，避免泛化建议。`);
-  parts.push('- JSON 顶层字段固定为：schema_version, mode, conclusion, clusters, evidence_chain, uncertainties, next_steps, metadata。');
+  parts.push('- JSON 顶层字段固定为：schema_version, mode, conclusion, clusters, evidence_chain, claims, uncertainties, next_steps, metadata。');
   parts.push(`- mode 必须是 "${params.mode}"。schema_version 必须是 "conclusion_contract_v1"。`);
-  parts.push('- 结论最终会渲染为“## 结论（按可能性排序）/## 聚类（先看大头）/## 证据链（对应上述结论）/## 不确定性与反例/## 下一步（最高信息增益）”。');
+  parts.push('- 结论最终会渲染为“## 结论（按可能性排序）/## 聚类（先看大头）/## 证据链（对应上述结论）/## 逐句数据引用/## 不确定性与反例/## 下一步（最高信息增益）”。');
   parts.push('- conclusion 数组最多 3 项，每项包含：rank, statement, confidence, trigger, supply, amplification。');
   parts.push('- clusters 每项包含：cluster, description, frames, percentage；若有帧级证据可额外提供 frame_refs(string[])。');
   parts.push(`- trigger/supply/amplification 需要能映射为：${TRIAD_LABELS.trigger}/${TRIAD_LABELS.supply}/${TRIAD_LABELS.amplification}。`);
@@ -3442,6 +3671,9 @@ function buildInsightFirstPrompt(params: {
     parts.push('- 单帧 drill-down 禁止复用历史 K1/K2/K3；clusters 传空数组。');
   }
   parts.push('- evidence_chain 必须按 C1/C2/C3 对齐（C1=结论1）：每项包含 conclusion_id 和 evidence 文本，且包含至少 1 个 evidence id（ev_xxxxxxxxxxxx）。');
+  parts.push('- claims 必须列出结论中出现的关键数值/实体判断，用于前端逐句核验；没有可核验数据时传空数组。');
+  parts.push('- claims 每项包含：id(Q1...), conclusion_id(C1...), text, references。');
+  parts.push('- claims[].references 每项包含：evidence_ref_id（优先使用 data:* 证据 ID）, source_ref（如 表 1/摘要 1）, source_tool_call_id（如可见）, row_index（0-based，不是第几行的 1-based 编号）, row_selector（行号不稳定时使用）, column, value。');
   parts.push('- metadata 可包含 confidence（0-100 或 0-1）与 rounds（正整数）。');
   parts.push('- metadata 可包含 cluster_policy 对象：{ output_mode: required|optional|none, frame_list_mode: none|top|full, max_frames_per_cluster?: number }。');
   parts.push('- metadata 可包含 scene_id（例如 jank/startup），用于前端场景化标题渲染。');

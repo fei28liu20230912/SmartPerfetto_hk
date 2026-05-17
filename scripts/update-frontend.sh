@@ -98,6 +98,18 @@ rsync -a --delete \
   "$VERSION_DIR/" \
   "$FRONTEND_DIR/$VERSION/"
 
+# Some upstream UI builds emit only the memory64 trace processor into
+# ui/dist/<version>/ while the classic wasm is left under the GN output wasm/
+# directory. The prebuild still needs both assets for older browser/runtime
+# paths, so copy the classic wasm from the same out tree when dist omits it.
+if [ ! -f "$FRONTEND_DIR/$VERSION/trace_processor.wasm" ]; then
+  OUT_ROOT="$(cd "$VERSION_DIR/../../.." && pwd)"
+  TRACE_PROCESSOR_WASM="$OUT_ROOT/wasm/trace_processor.wasm"
+  if [ -f "$TRACE_PROCESSOR_WASM" ]; then
+    cp "$TRACE_PROCESSOR_WASM" "$FRONTEND_DIR/$VERSION/trace_processor.wasm"
+  fi
+fi
+
 # Rollup and upstream runtime assets can emit indented blank lines. Keep
 # checked-in generated text artifacts compatible with git diff --check.
 for TEXT_ARTIFACT in \
@@ -135,6 +147,17 @@ const crypto = require('crypto');
 
 const [manifestPath, versionDir] = process.argv.slice(2);
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+manifest.resources ??= {};
+for (const required of ['trace_processor.wasm', 'trace_processor_memory64.wasm']) {
+  const filePath = path.join(versionDir, required);
+  if (fs.existsSync(filePath)) {
+    const hash = crypto
+      .createHash('sha256')
+      .update(fs.readFileSync(filePath))
+      .digest('base64');
+    manifest.resources[required] = `sha256-${hash}`;
+  }
+}
 for (const name of Object.keys(manifest.resources ?? {})) {
   const filePath = path.join(versionDir, name);
   if (!fs.existsSync(filePath)) continue;

@@ -32,6 +32,7 @@ interface VerifyOptions {
   outputPath?: string;
   keepSession: boolean;
   keepTrace: boolean;
+  requireConclusionEvidence: boolean;
   /** Analysis mode override forwarded as options.analysisMode to the backend. */
   analysisMode?: 'fast' | 'full' | 'auto';
 }
@@ -49,6 +50,19 @@ interface SseSummary {
   planSubmittedCount: number;
   architectureDetectedCount: number;
   errorEvents: string[];
+  /** Number of DataEnvelope objects carried by data events, not just event count. */
+  dataEnvelopeItemCount: number;
+  dataEnvelopeMissingPhaseCount: number;
+  dataEnvelopeAmbiguousPhaseCount: number;
+  dataEnvelopeUnexpectedPhaseCount: number;
+  dataEnvelopePhaseCounts: Record<string, number>;
+  conclusionChars: number;
+  conclusionHasConcreteEvidenceRefs: boolean;
+  conclusionHasEvidenceIndex: boolean;
+  analysisCompletedConclusionChars: number;
+  analysisCompletedHasConcreteEvidenceRefs: boolean;
+  analysisCompletedHasEvidenceIndex: boolean;
+  analysisCompletedReportUrl?: string;
   /** Older SSE fields that may still appear in archived sessions/logs. */
   stageNames: string[];
   stageTransitionCount: number;
@@ -57,20 +71,21 @@ interface SseSummary {
   directSkillFindingCount: number;
 }
 
-const DEFAULT_TRACE = '../test-traces/app_aosp_scrolling_heavy_jank.pftrace';
+const DEFAULT_TRACE = '../test-traces/scroll-demo-customer-scroll.pftrace';
 const DEFAULT_QUERY = '分析滑动性能';
 
 function printUsage(): void {
   console.log('Usage: npx tsx src/scripts/verifyAgentSseScrolling.ts [options]');
   console.log('');
   console.log('Options:');
-  console.log('  --trace <path>                    Trace path (default: ../test-traces/app_aosp_scrolling_heavy_jank.pftrace)');
+  console.log('  --trace <path>                    Trace path (default: ../test-traces/scroll-demo-customer-scroll.pftrace)');
   console.log('  --query <text>                    Analyze query (default: 分析滑动性能)');
   console.log('  --timeout-ms <number>             SSE timeout in ms (default: 600000)');
   console.log('  --max-rounds <number>             Analysis max rounds (default: 3)');
   console.log('  --confidence-threshold <number>   Analysis confidence threshold (default: 0.5)');
   console.log('  --mode <fast|full|auto>           Override analysisMode sent to backend (default: unset → classifier)');
   console.log('  --output <path>                   JSON report output path');
+  console.log('  --require-conclusion-evidence     Fail unless analysis_completed conclusion has concrete evidence refs');
   console.log('  --keep-session                    Do not delete session after verification');
   console.log('  --keep-trace                      Do not delete loaded trace after verification');
   console.log('  --help                            Show this help');
@@ -85,6 +100,7 @@ function parseArgs(argv: string[]): VerifyOptions {
     confidenceThreshold: 0.5,
     keepSession: false,
     keepTrace: false,
+    requireConclusionEvidence: false,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -103,6 +119,11 @@ function parseArgs(argv: string[]): VerifyOptions {
 
     if (arg === '--keep-trace') {
       options.keepTrace = true;
+      continue;
+    }
+
+    if (arg === '--require-conclusion-evidence') {
+      options.requireConclusionEvidence = true;
       continue;
     }
 
@@ -223,6 +244,61 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return null;
 }
 
+function hasConcreteEvidenceReferences(text: string): boolean {
+  return /art-\d+|data:[a-z0-9_:.:-]+|evidence_ref_id\s*=|evidence\s*(ref|id|source)\s*[:=]|source_ref\s*=|表\s*(?:art-\d+|sql:\d+)|\bsql:\d+\b/i.test(text);
+}
+
+function hasEvidenceIndex(text: string): boolean {
+  return text.includes('证据表索引');
+}
+
+function extractDataEnvelopes(parsed: unknown, parsedRecord: Record<string, unknown> | null): Array<Record<string, unknown>> {
+  const candidates = [
+    parsedRecord?.envelope,
+    asRecord(parsedRecord?.data)?.envelope,
+    parsed,
+    parsedRecord?.data,
+    asRecord(parsedRecord?.data)?.data,
+    parsedRecord?.content,
+    asRecord(parsedRecord?.content)?.data,
+  ];
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      return candidate
+        .map((item) => asRecord(item))
+        .filter((item): item is Record<string, unknown> => item !== null);
+    }
+
+    const record = asRecord(candidate);
+    if (record && asRecord(record.meta)) {
+      return [record];
+    }
+  }
+
+  return [];
+}
+
+function recordConclusionEvidence(
+  summary: SseSummary,
+  text: string,
+  target: 'conclusion' | 'analysis_completed',
+): void {
+  if (target === 'conclusion') {
+    summary.conclusionChars = Math.max(summary.conclusionChars, text.length);
+    summary.conclusionHasConcreteEvidenceRefs ||= hasConcreteEvidenceReferences(text);
+    summary.conclusionHasEvidenceIndex ||= hasEvidenceIndex(text);
+    return;
+  }
+
+  summary.analysisCompletedConclusionChars = Math.max(
+    summary.analysisCompletedConclusionChars,
+    text.length,
+  );
+  summary.analysisCompletedHasConcreteEvidenceRefs ||= hasConcreteEvidenceReferences(text);
+  summary.analysisCompletedHasEvidenceIndex ||= hasEvidenceIndex(text);
+}
+
 async function collectSseSummary(baseUrl: string, sessionId: string, timeoutMs: number): Promise<SseSummary> {
   const summary: SseSummary = {
     totalEvents: 0,
@@ -235,6 +311,17 @@ async function collectSseSummary(baseUrl: string, sessionId: string, timeoutMs: 
     planSubmittedCount: 0,
     architectureDetectedCount: 0,
     errorEvents: [],
+    dataEnvelopeItemCount: 0,
+    dataEnvelopeMissingPhaseCount: 0,
+    dataEnvelopeAmbiguousPhaseCount: 0,
+    dataEnvelopeUnexpectedPhaseCount: 0,
+    dataEnvelopePhaseCounts: {},
+    conclusionChars: 0,
+    conclusionHasConcreteEvidenceRefs: false,
+    conclusionHasEvidenceIndex: false,
+    analysisCompletedConclusionChars: 0,
+    analysisCompletedHasConcreteEvidenceRefs: false,
+    analysisCompletedHasEvidenceIndex: false,
     stageNames: [],
     stageTransitionCount: 0,
     directSkillProgressCount: 0,
@@ -319,9 +406,25 @@ async function collectSseSummary(baseUrl: string, sessionId: string, timeoutMs: 
               break;
             case 'conclusion':
               summary.conclusionCount += 1;
+              if (typeof payload?.conclusion === 'string') {
+                recordConclusionEvidence(summary, payload.conclusion, 'conclusion');
+              }
               break;
             case 'data':
               summary.dataEnvelopeCount += 1;
+              for (const envelope of extractDataEnvelopes(parsed, parsedRecord)) {
+                const meta = asRecord(envelope.meta);
+                const phaseId = typeof meta?.planPhaseId === 'string' ? meta.planPhaseId : '';
+                const attribution = typeof meta?.planPhaseAttribution === 'string'
+                  ? meta.planPhaseAttribution
+                  : '';
+                summary.dataEnvelopeItemCount += 1;
+                summary.dataEnvelopePhaseCounts[phaseId || '<missing>'] =
+                  (summary.dataEnvelopePhaseCounts[phaseId || '<missing>'] || 0) + 1;
+                if (!phaseId) summary.dataEnvelopeMissingPhaseCount += 1;
+                if (attribution === 'ambiguous') summary.dataEnvelopeAmbiguousPhaseCount += 1;
+                if (attribution === 'unexpected_tool') summary.dataEnvelopeUnexpectedPhaseCount += 1;
+              }
               break;
             case 'plan_submitted':
               summary.planSubmittedCount += 1;
@@ -331,6 +434,15 @@ async function collectSseSummary(baseUrl: string, sessionId: string, timeoutMs: 
               break;
             default:
               break;
+          }
+
+          if (event === 'analysis_completed') {
+            if (typeof payload?.conclusion === 'string') {
+              recordConclusionEvidence(summary, payload.conclusion, 'analysis_completed');
+            }
+            if (typeof payload?.reportUrl === 'string') {
+              summary.analysisCompletedReportUrl = payload.reportUrl;
+            }
           }
 
           // --- Older SSE counting (backwards compat) ---
@@ -504,9 +616,21 @@ async function main(): Promise<void> {
     } else if (options.analysisMode === 'full') {
       modeExpectationChecks.fullModeHonored = !isQuickMode;
     }
-    const checks = { ...requiredChecks, ...fullModeChecks, ...modeExpectationChecks };
+    const conclusionEvidenceChecks = options.requireConclusionEvidence
+      ? {
+        hasAnalysisCompletedConclusion: sse.analysisCompletedConclusionChars > 0,
+        hasAnalysisCompletedConclusionEvidence: sse.analysisCompletedHasConcreteEvidenceRefs,
+      }
+      : {};
+    const checks = {
+      ...requiredChecks,
+      ...fullModeChecks,
+      ...modeExpectationChecks,
+      ...conclusionEvidenceChecks,
+    };
     const passed = Object.values(requiredChecks).every(Boolean)
       && Object.values(modeExpectationChecks).every(Boolean)
+      && Object.values(conclusionEvidenceChecks).every(Boolean)
       && (isQuickMode || Object.values(fullModeChecks).every(Boolean));
     const sessionLogFile = findSessionLogFile(sessionId);
 

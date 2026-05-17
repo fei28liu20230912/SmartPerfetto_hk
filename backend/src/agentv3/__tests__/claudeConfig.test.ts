@@ -13,6 +13,7 @@ import {
   getClaudeRuntimeDiagnostics,
   getClaudeSdkBinaryDiagnostics,
   getSdkBinaryOption,
+  isClaudeQuotaError,
   loadClaudeConfig,
   resetSdkBinaryOptionCache,
 } from '../claudeConfig';
@@ -270,6 +271,12 @@ describe('explainClaudeRuntimeError', () => {
     const message = 'trace processor failed';
 
     expect(explainClaudeRuntimeError(message)).toBe(message);
+  });
+
+  it('classifies Claude usage limit messages as quota errors', () => {
+    expect(isClaudeQuotaError("You've hit your limit · resets 1am (Asia/Shanghai)")).toBe(true);
+    expect(isClaudeQuotaError('rate limit exceeded')).toBe(true);
+    expect(isClaudeQuotaError('trace processor failed')).toBe(false);
   });
 
   it('detects SDK native-binary-missing errors and points at CLAUDE_BINARY_PATH (zh-CN)', () => {

@@ -96,7 +96,7 @@ export class FrameStatsAnalyzer {
     startTs?: number,
     endTs?: number
   ): Promise<FrameStatsResult> {
-    const timeCondition = this.buildTimeCondition(startTs, endTs);
+    const timeCondition = this.buildTimeCondition(startTs, endTs, 'slice.ts');
     const packageCondition = packageName
       ? `AND process.name LIKE '%${this.escapeLikePattern(packageName)}%' ESCAPE '\\'`
       : '';
@@ -105,16 +105,16 @@ export class FrameStatsAnalyzer {
     // 使用 actual_frame_timeline_slice 表（Android 的帧时间线）
     const query = `
       SELECT
-        ts,
-        dur / 1e6 as dur_ms,
-        frame_number
+        slice.ts AS ts,
+        slice.dur / 1e6 AS dur_ms,
+        slice.frame_number AS frame_number
       FROM actual_frame_timeline_slice slice
       JOIN process_track track ON slice.track_id = track.id
       JOIN process ON track.upid = process.upid
-      WHERE dur > 0
+      WHERE slice.dur > 0
         ${timeCondition}
         ${packageCondition}
-      ORDER BY ts
+      ORDER BY slice.ts
     `;
 
     const result = await this.traceProcessor.query(traceId, query);
@@ -188,22 +188,22 @@ export class FrameStatsAnalyzer {
     startTs?: number,
     endTs?: number
   ): Promise<FrameStatsResult> {
-    const timeCondition = this.buildTimeCondition(startTs, endTs);
+    const timeCondition = this.buildTimeCondition(startTs, endTs, 's.ts');
 
     // 查找渲染相关的 slice
     const query = `
       SELECT
-        ts,
-        dur / 1e6 as dur_ms,
-        name
-      FROM slice
+        s.ts AS ts,
+        s.dur / 1e6 AS dur_ms,
+        s.name AS name
+      FROM slice s
       WHERE (
-        name LIKE 'Choreographer#doFrame'
-        OR name LIKE 'DrawFrame'
-        OR name LIKE 'performTraversals'
+        s.name LIKE 'Choreographer#doFrame'
+        OR s.name LIKE 'DrawFrame'
+        OR s.name LIKE 'performTraversals'
       )
       ${timeCondition}
-      ORDER BY ts
+      ORDER BY s.ts
     `;
 
     const result = await this.traceProcessor.query(traceId, query);
@@ -291,13 +291,13 @@ export class FrameStatsAnalyzer {
     }));
   }
 
-  private buildTimeCondition(startTs?: number, endTs?: number): string {
+  private buildTimeCondition(startTs?: number, endTs?: number, tsColumn = 'ts'): string {
     const safeStart = this.normalizeTimestamp(startTs);
     const safeEnd = this.normalizeTimestamp(endTs);
     if (safeStart === undefined && safeEnd === undefined) return '';
-    if (safeStart !== undefined && safeEnd === undefined) return `AND ts >= ${safeStart}`;
-    if (safeStart === undefined && safeEnd !== undefined) return `AND ts <= ${safeEnd}`;
-    return `AND ts >= ${safeStart} AND ts <= ${safeEnd}`;
+    if (safeStart !== undefined && safeEnd === undefined) return `AND ${tsColumn} >= ${safeStart}`;
+    if (safeStart === undefined && safeEnd !== undefined) return `AND ${tsColumn} <= ${safeEnd}`;
+    return `AND ${tsColumn} >= ${safeStart} AND ${tsColumn} <= ${safeEnd}`;
   }
 
   private normalizeTimestamp(ts?: number): number | undefined {

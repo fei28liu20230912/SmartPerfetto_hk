@@ -287,6 +287,18 @@ function nativeBinaryHint(message: string, lang: OutputLanguage): string {
   return `${message}\n\n${t.intro}\n${t.cause}\n${t.fix}\n  CLAUDE_BINARY_PATH=${NATIVE_BINARY_HINT_EXAMPLE}\n${t.inspectLabel} ${NATIVE_BINARY_HINT_INSPECT}`;
 }
 
+export function isClaudeQuotaError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return lower.includes("you've hit your limit") ||
+    lower.includes('hit your limit') ||
+    lower.includes('rate limit') ||
+    lower.includes('quota') ||
+    lower.includes('extra usage') ||
+    lower.includes('overage') ||
+    lower.includes('too many requests') ||
+    /\b429\b/.test(lower);
+}
+
 export interface CredentialSourceHint {
   source: 'provider-manager' | 'env-or-default';
   providerName?: string;
@@ -368,9 +380,7 @@ export function explainClaudeRuntimeError(
 
   const quotaOrAuth =
     lower.includes('out of') ||
-    lower.includes('extra usage') ||
-    lower.includes('rate limit') ||
-    lower.includes('quota') ||
+    isClaudeQuotaError(message) ||
     lower.includes('not logged in') ||
     lower.includes('unauthorized') ||
     lower.includes('401') ||

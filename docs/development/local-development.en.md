@@ -19,7 +19,7 @@ The repository includes `.nvmrc` and `.node-version`, and `.npmrc` enables `engi
 ./scripts/start-dev.sh
 ```
 
-The script handles backend dependencies, Perfetto UI dependencies, `trace_processor_shell`, backend `tsx watch`, and Perfetto UI `build.js --watch`.
+The script handles backend dependencies, Perfetto UI dependencies, `trace_processor_shell`, backend `tsx watch`, and Perfetto UI `build.mjs --watch`.
 
 | Service | Address |
 |---|---|

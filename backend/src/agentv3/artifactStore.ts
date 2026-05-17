@@ -26,6 +26,12 @@ export interface StoredArtifact {
   diagnostics?: any;
   storedAt: number;
   lastAccessedAt: number;
+  /** Analysis plan phase that originally produced this artifact. */
+  planPhaseId?: string;
+  planPhaseTitle?: string;
+  planPhaseGoal?: string;
+  sourceToolCallId?: string;
+  paramsHash?: string;
   /** In comparison mode, which trace this artifact came from (provenance tracking) */
   sourceTrace?: import('./types').TraceSource;
 }
@@ -40,6 +46,10 @@ export interface ArtifactSummary {
   columns: string[];
   sampleRow?: any[];
   diagnosticCount: number;
+  planPhaseId?: string;
+  planPhaseTitle?: string;
+  planPhaseGoal?: string;
+  sourceToolCallId?: string;
 }
 
 /**
@@ -56,6 +66,9 @@ export interface CompactArtifactSummary {
   preview?: Record<string, any>;
   /** Only present when diagnostics exist (> 0). */
   diagnosticCount?: number;
+  /** Origin phase for explaining why this artifact/table exists. */
+  planPhaseId?: string;
+  planPhaseTitle?: string;
 }
 
 export class ArtifactStore {
@@ -79,6 +92,11 @@ export class ArtifactStore {
     title?: string;
     data: any;
     diagnostics?: any;
+    planPhaseId?: string;
+    planPhaseTitle?: string;
+    planPhaseGoal?: string;
+    sourceToolCallId?: string;
+    paramsHash?: string;
   }): string {
     const id = `art-${++this.counter}`;
     const now = Date.now();
@@ -136,6 +154,10 @@ export class ArtifactStore {
       columns,
       sampleRow: rows.length > 0 ? rows[0] : undefined,
       diagnosticCount: Array.isArray(artifact.diagnostics) ? artifact.diagnostics.length : 0,
+      planPhaseId: artifact.planPhaseId,
+      planPhaseTitle: artifact.planPhaseTitle,
+      planPhaseGoal: artifact.planPhaseGoal,
+      sourceToolCallId: artifact.sourceToolCallId,
     };
   }
 
@@ -165,6 +187,8 @@ export class ArtifactStore {
       rowCount: full.rowCount,
       ...(preview ? { preview } : {}),
       ...(full.diagnosticCount > 0 ? { diagnosticCount: full.diagnosticCount } : {}),
+      ...(full.planPhaseId ? { planPhaseId: full.planPhaseId } : {}),
+      ...(full.planPhaseTitle ? { planPhaseTitle: full.planPhaseTitle } : {}),
     };
   }
 
@@ -197,6 +221,11 @@ export class ArtifactStore {
           limit: effectiveLimit,
           hasMore,
           diagnostics: artifact.diagnostics,
+          planPhaseId: artifact.planPhaseId,
+          planPhaseTitle: artifact.planPhaseTitle,
+          planPhaseGoal: artifact.planPhaseGoal,
+          sourceToolCallId: artifact.sourceToolCallId,
+          paramsHash: artifact.paramsHash,
         };
       }
       case 'full': {
@@ -215,6 +244,11 @@ export class ArtifactStore {
           title: artifact.title,
           data: cappedData,
           diagnostics: artifact.diagnostics,
+          planPhaseId: artifact.planPhaseId,
+          planPhaseTitle: artifact.planPhaseTitle,
+          planPhaseGoal: artifact.planPhaseGoal,
+          sourceToolCallId: artifact.sourceToolCallId,
+          paramsHash: artifact.paramsHash,
           ...(truncatedFull ? { truncated: true, totalRows: fullRows.length, hint: 'Use detail="rows" with offset/limit for complete data' } : {}),
         };
       }

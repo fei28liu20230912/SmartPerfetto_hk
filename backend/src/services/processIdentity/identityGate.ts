@@ -234,11 +234,25 @@ function rewriteParams(
     // process_name regardless of which alias the caller originally supplied.
     const declaredInputs = new Set((skill.inputs || []).map(input => input.name));
     const hasInputDeclarations = Array.isArray(skill.inputs) && skill.inputs.length > 0;
+    if (hasInputDeclarations) {
+      for (const alias of aliases) {
+        if (declaredInputs.has(alias) && rewritten[alias] === undefined) {
+          rewritten[alias] = recommended;
+        }
+      }
+    }
     if (rewritten.package !== undefined || declaredInputs.has('package') || !hasInputDeclarations) {
       rewritten.package = recommended;
     }
     if (rewritten.process_name !== undefined || declaredInputs.has('process_name') || !hasInputDeclarations) {
       rewritten.process_name = recommended;
+    }
+    if (hasInputDeclarations) {
+      for (const alias of aliases) {
+        if (!declaredInputs.has(alias)) {
+          delete rewritten[alias];
+        }
+      }
     }
   }
 

@@ -84,6 +84,13 @@ function snapshot(overrides: Partial<AnalysisResultSnapshot>): AnalysisResultSna
     traceLabel: 'trace-a',
     traceMetadata: { deviceModel: 'Pixel' },
     summary: { headline: 'Startup analyzed', confidence: 0.8 },
+    conclusionContract: {
+      claims: [{
+        id: 'Q1',
+        text: 'Startup analyzed',
+        references: [{ evidenceRefId: 'env-a', sourceRef: '表 1' }],
+      }],
+    },
     metrics: [
       {
         key: 'startup.total_ms',
@@ -141,6 +148,9 @@ describe('AnalysisResultSnapshotRepository', () => {
       status: 'ready',
       schemaVersion: ANALYSIS_RESULT_SNAPSHOT_SCHEMA_VERSION,
     }));
+    expect(loaded?.conclusionContract).toEqual(expect.objectContaining({
+      claims: [expect.objectContaining({ id: 'Q1' })],
+    }));
     expect(loaded?.metrics).toHaveLength(1);
     expect(loaded?.metrics[0]).toEqual(expect.objectContaining({
       key: 'startup.total_ms',
@@ -158,6 +168,52 @@ describe('AnalysisResultSnapshotRepository', () => {
       'analysis_result.created',
       'analysis_result.read',
     ]);
+  });
+
+  test('scopes evidence storage rows by snapshot so stable evidence ids can repeat across runs', () => {
+    const repo = createAnalysisResultSnapshotRepository(db!);
+    repo.createSnapshot(snapshot({
+      id: 'snapshot-a',
+      evidenceRefs: [{
+        id: 'data:skill:startup_analysis:summary',
+        type: 'data_envelope',
+        dataEnvelopeId: 'env-a',
+        runId: 'run-a',
+      }],
+    }));
+    repo.createSnapshot(snapshot({
+      id: 'snapshot-b',
+      traceId: 'trace-b',
+      sessionId: 'session-b',
+      runId: 'run-b',
+      createdBy: 'user-b',
+      evidenceRefs: [{
+        id: 'data:skill:startup_analysis:summary',
+        type: 'data_envelope',
+        dataEnvelopeId: 'env-b',
+        runId: 'run-b',
+      }],
+    }));
+
+    const rows = db!.prepare<unknown[], { id: string; snapshot_id: string }>(`
+      SELECT id, snapshot_id
+      FROM analysis_result_evidence_refs
+      WHERE id LIKE '%data:skill:startup_analysis:summary'
+      ORDER BY snapshot_id ASC
+    `).all();
+
+    expect(rows).toEqual([
+      { id: 'snapshot-a:data:skill:startup_analysis:summary', snapshot_id: 'snapshot-a' },
+      { id: 'snapshot-b:data:skill:startup_analysis:summary', snapshot_id: 'snapshot-b' },
+    ]);
+    expect(repo.getSnapshot(
+      { tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'user-a' },
+      'snapshot-a',
+    )?.evidenceRefs[0]?.id).toBe('data:skill:startup_analysis:summary');
+    expect(repo.getSnapshot(
+      { tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'user-b' },
+      'snapshot-b',
+    )?.evidenceRefs[0]?.id).toBe('data:skill:startup_analysis:summary');
   });
 
   test('enforces private visibility by creator and workspace visible sharing', () => {
@@ -191,6 +247,11 @@ describe('AnalysisResultSnapshotRepository', () => {
       userId: 'user-a',
     });
     expect(listForUserA.map(item => item.id).sort()).toEqual(['private-a', 'workspace-b']);
+    expect(listForUserA[0].conclusionContract).toBeUndefined();
+    expect(repo.listSnapshots(
+      { tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'user-a' },
+      { includeConclusionContract: true },
+    ).some(item => item.conclusionContract)).toBe(true);
   });
 
   test('does not leak across workspace or tenant and restricts visibility updates to owners', () => {

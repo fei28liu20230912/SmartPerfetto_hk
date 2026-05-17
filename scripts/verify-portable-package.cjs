@@ -6,6 +6,7 @@
 'use strict';
 
 const { execFileSync } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -107,6 +108,7 @@ const FRONTEND_TOP_LEVEL_SYNTAQLITE_ASSETS = [
 ];
 
 const FRONTEND_VERSIONED_REQUIRED_ASSETS = [
+  'manifest.json',
   'frontend_bundle.js',
   'engine_bundle.js',
   'traceconv_bundle.js',
@@ -192,6 +194,51 @@ function readEntryBuffer(assetPath, ext, entry) {
   throw new Error(`Unsupported archive extension: ${ext}`);
 }
 
+function extractArchiveToTemp(assetPath, ext) {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smartperfetto-package-verify-'));
+  try {
+    if (ext === 'zip') {
+      execFileSync('unzip', ['-q', assetPath, '-d', tmpRoot], { stdio: 'pipe' });
+    } else if (ext === 'tar.gz') {
+      execFileSync('tar', ['-xzf', assetPath, '-C', tmpRoot], { stdio: 'pipe' });
+    } else {
+      throw new Error(`Unsupported archive extension: ${ext}`);
+    }
+  } catch (error) {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    throw error;
+  }
+  return tmpRoot;
+}
+
+function extractedEntryPath(tmpRoot, entry) {
+  const root = path.resolve(tmpRoot);
+  const resolved = path.resolve(root, entry);
+  assert(resolved.startsWith(`${root}${path.sep}`), `Archive entry escapes verification root: ${entry}`);
+  return resolved;
+}
+
+function readExtractedBuffer(tmpRoot, entry) {
+  return fs.readFileSync(extractedEntryPath(tmpRoot, entry));
+}
+
+function readExtractedText(tmpRoot, entry) {
+  return readExtractedBuffer(tmpRoot, entry).toString('utf8');
+}
+
+function readExtractedJson(tmpRoot, entry) {
+  try {
+    return JSON.parse(readExtractedText(tmpRoot, entry));
+  } catch (error) {
+    throw new Error(`Invalid JSON in ${entry}: ${error.message || error}`);
+  }
+}
+
+function assertExtractedEntryNonEmpty(tmpRoot, entry) {
+  const bytes = readExtractedBuffer(tmpRoot, entry);
+  assert(bytes.length > 0, `Package entry is empty: ${entry}`);
+}
+
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
@@ -204,6 +251,10 @@ function assertBinaryKind(bytes, label, kind) {
       ? bytes[0] === 0x7f && bytes[1] === 0x45 && bytes[2] === 0x4c && bytes[3] === 0x46
       : ['cffaedfe', 'cafebabe', 'feedfacf', 'feedface'].includes(hex);
   assert(ok, `${label} is not a ${kind} binary`);
+}
+
+function sha256Resource(bytes) {
+  return `sha256-${crypto.createHash('sha256').update(bytes).digest('base64')}`;
 }
 
 function stableVersionFromIndex(indexHtml) {
@@ -301,40 +352,71 @@ function main() {
     `Archive must contain exactly one top-level directory: ${packageName}/`,
   );
 
+  const extractedRoot = extractArchiveToTemp(assetPath, target.ext);
+  process.on('exit', () => {
+    fs.rmSync(extractedRoot, { recursive: true, force: true });
+  });
+
   for (const rel of target.required) {
     assertEntryExists(entries, packageName, rel);
   }
 
   const frontendRoot = frontendRootForTarget(target);
   const frontendIndexEntry = `${packageName}/${frontendRoot}/index.html`;
-  const frontendStableVersion = stableVersionFromIndex(readEntry(assetPath, target.ext, frontendIndexEntry));
+  const frontendStableVersion = stableVersionFromIndex(readExtractedText(extractedRoot, frontendIndexEntry));
   assert(frontendStableVersion, `${frontendIndexEntry} does not declare data-perfetto_version.stable`);
+
+  const frontendManifestEntry = assertEntryExists(
+    entries,
+    packageName,
+    `${frontendRoot}/${frontendStableVersion}/manifest.json`,
+  );
+  const frontendManifest = readExtractedJson(extractedRoot, frontendManifestEntry);
+  const frontendManifestResources = frontendManifest.resources ?? {};
+  for (const requiredManifestResource of ['trace_processor.wasm', 'trace_processor_memory64.wasm']) {
+    assert(
+      typeof frontendManifestResources[requiredManifestResource] === 'string',
+      `${frontendManifestEntry} is missing required resource hash: ${requiredManifestResource}`,
+    );
+  }
+  for (const [resource, expectedHash] of Object.entries(frontendManifestResources)) {
+    const resourceEntry = assertEntryExists(
+      entries,
+      packageName,
+      `${frontendRoot}/${frontendStableVersion}/${resource}`,
+    );
+    const actualHash = sha256Resource(readExtractedBuffer(extractedRoot, resourceEntry));
+    assert(
+      actualHash === expectedHash,
+      `Frontend manifest hash mismatch for ${resourceEntry}: expected ${expectedHash}, got ${actualHash}`,
+    );
+  }
 
   for (const rel of FRONTEND_TOP_LEVEL_SYNTAQLITE_ASSETS) {
     const entry = assertEntryExists(entries, packageName, `${frontendRoot}/${rel}`);
-    assertEntryNonEmpty(assetPath, target.ext, entry);
+    assertExtractedEntryNonEmpty(extractedRoot, entry);
   }
 
   for (const rel of FRONTEND_VERSIONED_REQUIRED_ASSETS) {
     const entry = assertEntryExists(entries, packageName, `${frontendRoot}/${frontendStableVersion}/${rel}`);
-    assertEntryNonEmpty(assetPath, target.ext, entry);
+    assertExtractedEntryNonEmpty(extractedRoot, entry);
   }
 
   const frontendBundleEntry = `${packageName}/${frontendRoot}/${frontendStableVersion}/frontend_bundle.js`;
-  const frontendBundleText = readEntry(assetPath, target.ext, frontendBundleEntry);
+  const frontendBundleText = readExtractedText(extractedRoot, frontendBundleEntry);
   const referencedSyntaqliteAssets = [...frontendBundleText.matchAll(/["'](assets\/syntaqlite-[^"']+)["']/g)]
     .map(match => match[1]);
   for (const rel of [...new Set(referencedSyntaqliteAssets)].sort()) {
     const entry = assertEntryExists(entries, packageName, `${frontendRoot}/${rel}`);
-    assertEntryNonEmpty(assetPath, target.ext, entry);
+    assertExtractedEntryNonEmpty(extractedRoot, entry);
   }
 
   for (const rel of target.binaryRequired) {
     const entry = `${packageName}/${rel}`;
-    assertBinaryKind(readEntryBuffer(assetPath, target.ext, entry), entry, target.binaryKind);
+    assertBinaryKind(readExtractedBuffer(extractedRoot, entry), entry, target.binaryKind);
   }
 
-  const manifest = readJsonEntry(assetPath, target.ext, `${packageName}/PACKAGE-MANIFEST.json`);
+  const manifest = readExtractedJson(extractedRoot, `${packageName}/PACKAGE-MANIFEST.json`);
   assert(manifest.name === 'smartperfetto', `Manifest name mismatch: ${manifest.name}`);
   assert(manifest.version === version, `Manifest version mismatch: expected ${version}, got ${manifest.version}`);
   assert(manifest.packageName === packageName, `Manifest packageName mismatch: expected ${packageName}, got ${manifest.packageName}`);
@@ -345,11 +427,11 @@ function main() {
   const backendPackageEntry = target.os === 'macos'
     ? `${packageName}/SmartPerfetto.app/Contents/Resources/backend/package.json`
     : `${packageName}/backend/package.json`;
-  const backendPackage = readJsonEntry(assetPath, target.ext, backendPackageEntry);
+  const backendPackage = readExtractedJson(extractedRoot, backendPackageEntry);
   assert(backendPackage.name === '@gracker/smartperfetto', `Backend package name mismatch: ${backendPackage.name}`);
   assert(backendPackage.version === version, `Backend package version mismatch: expected ${version}, got ${backendPackage.version}`);
 
-  const readme = readEntry(assetPath, target.ext, `${packageName}/${target.readme}`);
+  const readme = readExtractedText(extractedRoot, `${packageName}/${target.readme}`);
   assert(readme.includes(`Version: ${version}`), `${target.readme} does not contain the package version`);
 
   if (opts.commit) {

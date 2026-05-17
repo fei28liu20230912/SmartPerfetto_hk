@@ -36,9 +36,26 @@ const targetSkill: SkillDefinition = {
   sql: "SELECT '${process_name}' AS process_name",
 };
 
+const packageTargetSkill: SkillDefinition = {
+  name: 'target_package_skill',
+  version: '1.0',
+  type: 'atomic',
+  meta: { display_name: 'Target Package', description: 'Target Package' },
+  identity: {
+    policy: 'required',
+    scope: 'process',
+    aliases: ['process_name', 'package'],
+    rewriteTo: 'recommended_process_name_param',
+  },
+  inputs: [
+    { name: 'package', type: 'string', required: true },
+  ],
+  sql: "SELECT '${package}' AS package_name, '${process_name}' AS leaked_process_name",
+};
+
 function createExecutor(query: jest.Mock): SkillExecutor {
   const executor = new SkillExecutor({ query });
-  executor.registerSkills([resolverSkill, targetSkill]);
+  executor.registerSkills([resolverSkill, targetSkill, packageTargetSkill]);
   return executor;
 }
 
@@ -63,6 +80,28 @@ describe('SkillExecutor process identity gate', () => {
     expect(result.success).toBe(true);
     expect(query).toHaveBeenCalledTimes(2);
     expect(query.mock.calls[1][1]).toContain("SELECT 'com.real.process' AS process_name");
+  });
+
+  it('does not leak undeclared process aliases into skill parameter validation', async () => {
+    const query = jest.fn()
+      .mockResolvedValueOnce({
+        columns: ['rank', 'confidence_score', 'identity_status', 'canonical_package_name', 'recommended_process_name_param', 'upid', 'target_match_sources', 'supporting_sources', 'identity_warning'],
+        rows: [[1, 90, 'confirmed', 'com.example', 'com.real.process', 42, 'android_process_metadata.package_name', 'frame_timeline.upid', 'ok']],
+        durationMs: 1,
+      })
+      .mockResolvedValueOnce({
+        columns: ['package_name', 'leaked_process_name'],
+        rows: [['com.real.process', '']],
+        durationMs: 1,
+      });
+
+    const result = await createExecutor(query).execute('target_package_skill', 'trace', {
+      process_name: 'com.example',
+    });
+
+    expect(result.success).toBe(true);
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls[1][1]).toContain("SELECT 'com.real.process' AS package_name, '' AS leaked_process_name");
   });
 
   it('blocks required process skills when resolver returns only weak identity evidence', async () => {

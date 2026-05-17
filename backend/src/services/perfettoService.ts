@@ -89,9 +89,9 @@ class PerfettoService {
   async getTraceInfo(traceFilePath: string): Promise<TraceInfo> {
     const sqlQuery = `
       SELECT
-        MAX(ts + dur) AS totalTimeNs,
-        COUNT(DISTINCT cpu) AS numCpus,
-        COUNT(DISTINCT CASE WHEN name LIKE 'GPU%' THEN cpu END) AS numGpus,
+        MAX(slice.ts + slice.dur) AS totalTimeNs,
+        COUNT(DISTINCT sched.cpu) AS numCpus,
+        COUNT(DISTINCT CASE WHEN slice.name LIKE 'GPU%' THEN sched.cpu END) AS numGpus,
         COUNT(DISTINCT process.name) AS numProcessNames,
         COUNT(DISTINCT thread.tid) AS numThreads
       FROM slice

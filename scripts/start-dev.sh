@@ -118,7 +118,7 @@ cleanup() {
   pkill -f "$PROJECT_ROOT/backend/node_modules/.bin/tsx watch src/index.ts" 2>/dev/null || true
   pkill -f "tsc.*perfetto.*watch" 2>/dev/null || true
   pkill -f "rollup.*perfetto.*watch" 2>/dev/null || true
-  pkill -f "node.*perfetto/ui/build.js" 2>/dev/null || true
+  pkill -f "node.*perfetto/ui/build.mjs" 2>/dev/null || true
 
   # Remove PID files
   rm -f "$PROJECT_ROOT/.backend.pid" "$PROJECT_ROOT/.frontend.pid" 2>/dev/null || true
@@ -667,7 +667,7 @@ echo "Cleaning up zombie watch processes..."
 pkill -f "$PROJECT_ROOT/backend/node_modules/.bin/tsx watch src/index.ts" 2>/dev/null || true
 pkill -f "tsc.*perfetto.*watch" 2>/dev/null || true
 pkill -f "rollup.*perfetto.*watch" 2>/dev/null || true
-pkill -f "node.*perfetto/ui/build.js" 2>/dev/null || true
+pkill -f "node.*perfetto/ui/build.mjs" 2>/dev/null || true
 
 # Kill orphan trace_processor_shell processes (except the one we'll use)
 echo "Cleaning up orphan trace_processor_shell processes..."
@@ -751,7 +751,7 @@ if [ "$SKIP_BUILD" = false ]; then
   # Build frontend using Perfetto's build system
   echo "Building frontend..."
   cd "$PERFETTO_DIR"
-  if ! "$PERFETTO_NODE" ui/build.js --no-depscheck --no-wasm --only-wasm-memory64 2>&1 | tee -a "$FRONTEND_LOG"; then
+  if ! "$PERFETTO_NODE" ui/build.mjs --no-depscheck --no-wasm --only-wasm-memory64 2>&1 | tee -a "$FRONTEND_LOG"; then
     echo "=============================================="
     echo "Frontend build failed!"
     echo ""
@@ -767,7 +767,7 @@ if [ "$SKIP_BUILD" = false ]; then
 else
   echo "Skipping build (--quick mode)..."
   # Verify that build artifacts exist
-  # Perfetto UI build output lives under out/ui/ui/ (see ui/build.js ensureDir()).
+  # Perfetto UI build output lives under out/ui/ui/ (see ui/build.mjs ensureDir()).
   if [ ! -d "$PERFETTO_DIR/out/ui/ui/dist" ] && [ ! -d "$PERFETTO_DIR/out/ui/dist" ]; then
     echo "ERROR: Frontend build artifacts not found. Run without --quick first."
     exit 1

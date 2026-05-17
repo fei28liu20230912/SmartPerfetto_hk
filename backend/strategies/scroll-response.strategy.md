@@ -62,17 +62,17 @@ invoke_skill("input_events_in_range", { event_type: "MOTION", event_action: "MOV
 如果该 Skill 不可用，使用 SQL 回退：
 ```sql
 SELECT
-  printf('%d', ts) AS ts,
-  printf('%d', dur) AS dur,
-  ROUND(dur / 1e6, 2) AS dur_ms,
-  arg_set_id,
-  EXTRACT_ARG(arg_set_id, 'event_action') AS action,
-  EXTRACT_ARG(arg_set_id, 'event_type') AS type
-FROM slice
-WHERE name = 'aq:pending:deliver'
-  OR name GLOB 'deliverInputEvent*'
-  OR name GLOB '*InputEvent*'
-ORDER BY ts
+  printf('%d', s.ts) AS ts,
+  printf('%d', s.dur) AS dur,
+  ROUND(s.dur / 1e6, 2) AS dur_ms,
+  s.arg_set_id,
+  EXTRACT_ARG(s.arg_set_id, 'event_action') AS action,
+  EXTRACT_ARG(s.arg_set_id, 'event_type') AS type
+FROM slice s
+WHERE s.name = 'aq:pending:deliver'
+  OR s.name GLOB 'deliverInputEvent*'
+  OR s.name GLOB '*InputEvent*'
+ORDER BY s.ts
 LIMIT 50
 ```
 
@@ -128,13 +128,13 @@ response_latency = frame_present_ts - gesture_start_ts
 ```sql
 -- 查找输入事件分发耗时
 SELECT
-  printf('%d', ts) AS ts,
-  ROUND(dur / 1e6, 2) AS dispatch_ms
-FROM slice
-WHERE name = 'aq:pending:deliver'
-  AND ts <= {gesture_start_ts} + 50000000  -- 50ms window
-  AND ts >= {gesture_start_ts} - 10000000
-ORDER BY ts
+  printf('%d', s.ts) AS ts,
+  ROUND(s.dur / 1e6, 2) AS dispatch_ms
+FROM slice s
+WHERE s.name = 'aq:pending:deliver'
+  AND s.ts <= {gesture_start_ts} + 50000000  -- 50ms window
+  AND s.ts >= {gesture_start_ts} - 10000000
+ORDER BY s.ts
 LIMIT 5
 ```
 
@@ -145,39 +145,40 @@ LIMIT 5
 **段 3：App frame build（measure + layout + draw）**
 ```sql
 SELECT
-  printf('%d', ts) AS ts,
-  ROUND(dur / 1e6, 2) AS dur_ms,
-  name
-FROM slice
-WHERE name IN ('Choreographer#doFrame', 'measure', 'layout', 'draw', 'Record View#draw()')
-  AND ts >= {gesture_start_ts}
-  AND ts <= {gesture_start_ts} + 200000000  -- 200ms window
-ORDER BY ts
+  printf('%d', s.ts) AS ts,
+  ROUND(s.dur / 1e6, 2) AS dur_ms,
+  s.name AS slice_name
+FROM slice s
+WHERE s.name IN ('Choreographer#doFrame', 'measure', 'layout', 'draw', 'Record View#draw()')
+  AND s.ts >= {gesture_start_ts}
+  AND s.ts <= {gesture_start_ts} + 200000000  -- 200ms window
+ORDER BY s.ts
 LIMIT 20
 ```
 
 **段 4：Render thread（sync + draw commands + swap buffers）**
 ```sql
 SELECT
-  printf('%d', ts) AS ts,
-  ROUND(dur / 1e6, 2) AS dur_ms,
-  name
-FROM slice
-WHERE name IN ('DrawFrame', 'syncFrameState', 'flush commands', 'eglSwapBuffersWithDamageKHR')
-  AND ts >= {gesture_start_ts}
-  AND ts <= {gesture_start_ts} + 200000000
-ORDER BY ts
+  printf('%d', s.ts) AS ts,
+  ROUND(s.dur / 1e6, 2) AS dur_ms,
+  s.name AS slice_name
+FROM slice s
+WHERE s.name IN ('DrawFrame', 'syncFrameState', 'flush commands', 'eglSwapBuffersWithDamageKHR')
+  AND s.ts >= {gesture_start_ts}
+  AND s.ts <= {gesture_start_ts} + 200000000
+ORDER BY s.ts
 LIMIT 20
 ```
 
 **段 5：SurfaceFlinger composition（合成 + present）**
 ```sql
 SELECT
-  printf('%d', ts) AS ts,
-  ROUND(dur / 1e6, 2) AS dur_ms,
-  name
+  printf('%d', s.ts) AS ts,
+  ROUND(s.dur / 1e6, 2) AS dur_ms,
+  s.name AS slice_name
 FROM slice s
-JOIN thread t ON s.track_id = t.utid
+JOIN thread_track tt ON s.track_id = tt.id
+JOIN thread t ON tt.utid = t.utid
 WHERE t.name = 'surfaceflinger'
   AND s.name IN ('onMessageReceived', 'INVALIDATE', 'REFRESH')
   AND s.ts >= {gesture_start_ts}

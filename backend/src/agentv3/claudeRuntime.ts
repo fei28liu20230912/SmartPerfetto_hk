@@ -36,13 +36,14 @@ import {
 import { extractFindingsFromText, extractFindingsFromSkillResult, mergeFindings } from './claudeFindingExtractor';
 import {
   createQuickConfig,
-  createSdkEnv,
-  explainClaudeRuntimeError,
-  getCredentialSourceHint,
-  getSdkBinaryOption,
-  loadClaudeConfig,
-  resolveEffort,
-  resolveRuntimeConfig,
+	  createSdkEnv,
+	  explainClaudeRuntimeError,
+	  getCredentialSourceHint,
+	  getSdkBinaryOption,
+	  isClaudeQuotaError,
+	  loadClaudeConfig,
+	  resolveEffort,
+	  resolveRuntimeConfig,
   type ClaudeAgentConfig,
 } from './claudeConfig';
 import { detectFocusApps } from './focusAppDetector';
@@ -78,6 +79,66 @@ function parseQuickBudgetEnv(): number | undefined {
   if (!v) return undefined;
   const n = Number.parseInt(v, 10);
   return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+function parseLeadingJsonObject(text: string): Record<string, unknown> | null {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+    } else if (char === '{') {
+      depth++;
+    } else if (char === '}') {
+      depth--;
+      if (depth === 0) {
+        try {
+          const parsed = JSON.parse(text.slice(0, i + 1));
+          return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? parsed as Record<string, unknown>
+            : null;
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function extractPlanPhaseIdFromToolResult(resultStr: string): string | undefined {
+  const candidates: string[] = [resultStr];
+  try {
+    const parsed = JSON.parse(resultStr);
+    const entries = Array.isArray(parsed) ? parsed : [parsed];
+    for (const entry of entries) {
+      if (entry && typeof entry === 'object' && typeof (entry as any).text === 'string') {
+        candidates.push((entry as any).text);
+      }
+    }
+  } catch {
+    // Fall through to leading-object parsing below.
+  }
+
+  for (const candidate of candidates) {
+    const trimmed = candidate.trim();
+    const parsed = parseLeadingJsonObject(trimmed);
+    const planPhaseId = parsed?.planPhaseId;
+    if (typeof planPhaseId === 'string' && planPhaseId.trim()) return planPhaseId.trim();
+  }
+  return undefined;
 }
 import { probeTraceCompleteness } from './traceCompletenessProber';
 import {
@@ -1140,12 +1201,20 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
                   timestamp: Date.now(),
                   ...callSummary,
                 };
-                // Priority: in_progress phase first, then any pending phase whose expectations match
-                const activePhase = plan.phases.find(p => p.status === 'in_progress');
-                let matchedPhaseId: string | undefined;
-                if (activePhase && phaseMatchesCall(activePhase, candidate)) {
-                  matchedPhaseId = activePhase.id;
-                } else {
+                const toolReturnedPhaseId = extractPlanPhaseIdFromToolResult(resultStr);
+                let matchedPhaseId = toolReturnedPhaseId &&
+                  plan.phases.some(p => p.id === toolReturnedPhaseId)
+                  ? toolReturnedPhaseId
+                  : undefined;
+                // Priority: MCP-side semantic attribution first, then in_progress phase,
+                // then any pending phase whose expectations match.
+                if (!matchedPhaseId) {
+                  const activePhase = plan.phases.find(p => p.status === 'in_progress');
+                  if (activePhase && phaseMatchesCall(activePhase, candidate)) {
+                    matchedPhaseId = activePhase.id;
+                  }
+                }
+                if (!matchedPhaseId) {
                   const pendingMatch = plan.phases.find(p =>
                     p.status === 'pending' && phaseMatchesCall(p, candidate),
                   );
@@ -1330,6 +1399,30 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       }
       allFindings.push(extractFindingsFromText(conclusionText));
       let mergedFindings = mergeFindings(allFindings);
+
+      if (conclusionText.trim() && ctx.analysisPlan.current) {
+        const plan = ctx.analysisPlan.current;
+        const conclusionPhase = plan.phases.find(p =>
+          p.status === 'pending' &&
+          p.expectedTools.length === 0 &&
+          /结论|conclusion|报告|report|总结/.test(`${p.name} ${p.goal}`),
+        );
+        if (conclusionPhase) {
+          const summary = localize(
+            this.config.outputLanguage,
+            `自动完成阶段：模型已生成最终结论（${conclusionText.length} 字符）。`,
+            `Auto-completed phase: the model produced the final conclusion (${conclusionText.length} chars).`,
+          );
+          conclusionPhase.status = 'completed';
+          conclusionPhase.completedAt = Date.now();
+          conclusionPhase.summary = summary;
+          this.emitUpdate({
+            type: 'plan_phase_updated',
+            content: { phaseId: conclusionPhase.id, status: 'completed', summary, phaseName: conclusionPhase.name },
+            timestamp: Date.now(),
+          });
+        }
+      }
 
       // Log compaction for diagnostics — helps debug cases where Claude seems to lose context
       if (sdkCompactDetected) {
@@ -1699,13 +1792,15 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         terminationReason,
         terminationMessage,
       };
-    } catch (error) {
-      const errMsg = explainClaudeRuntimeError(
-        (error as Error).message || 'Unknown error',
-        this.config.outputLanguage,
-        getCredentialSourceHint(options.providerId, providerScopeFromOptions(options)),
-      );
-      console.error('[ClaudeRuntime] Analysis failed:', errMsg);
+	    } catch (error) {
+	      const rawErrorMessage = (error as Error).message || 'Unknown error';
+	      const errMsg = explainClaudeRuntimeError(
+	        rawErrorMessage,
+	        this.config.outputLanguage,
+	        getCredentialSourceHint(options.providerId, providerScopeFromOptions(options)),
+	      );
+	      const quotaExceeded = isClaudeQuotaError(rawErrorMessage);
+	      console.error('[ClaudeRuntime] Analysis failed:', errMsg);
 
       // P1-3: Preserve partial findings and generate partial conclusion on mid-stream errors
       const partialFindings = mergeFindings(allFindings);
@@ -1740,12 +1835,12 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
           conclusion: partialConclusion,
           confidence: this.estimateConfidence(partialFindings) * 0.7, // penalize for incomplete
           rounds,
-          totalDurationMs: Date.now() - startTime,
-          partial: true,
-          terminationReason: 'execution_error',
-          terminationMessage: errMsg,
-        };
-      }
+	          totalDurationMs: Date.now() - startTime,
+	          partial: true,
+	          terminationReason: quotaExceeded ? 'max_budget_usd' : 'execution_error',
+	          terminationMessage: errMsg,
+	        };
+	      }
 
       this.emitUpdate({
         type: 'error',
@@ -1764,12 +1859,12 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
           `分析过程中出错: ${errMsg}`,
           `An error occurred during analysis: ${errMsg}`,
         ),
-        confidence: 0,
-        rounds,
-        totalDurationMs: Date.now() - startTime,
-        terminationReason: 'execution_error',
-        terminationMessage: errMsg,
-      };
+	        confidence: 0,
+	        rounds,
+	        totalDurationMs: Date.now() - startTime,
+	        terminationReason: quotaExceeded ? 'max_budget_usd' : 'execution_error',
+	        terminationMessage: errMsg,
+	      };
     } finally {
       this.activeAnalyses.delete(sessionId);
       runSnapshots.release(sessionId);
@@ -2101,13 +2196,15 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         terminationReason,
         terminationMessage,
       };
-    } catch (error) {
-      const errMsg = explainClaudeRuntimeError(
-        (error as Error).message || 'Unknown error',
-        this.config.outputLanguage,
-        getCredentialSourceHint(options.providerId, providerScopeFromOptions(options)),
-      );
-      console.error('[ClaudeRuntime] Quick analysis failed:', errMsg);
+	    } catch (error) {
+	      const rawErrorMessage = (error as Error).message || 'Unknown error';
+	      const errMsg = explainClaudeRuntimeError(
+	        rawErrorMessage,
+	        this.config.outputLanguage,
+	        getCredentialSourceHint(options.providerId, providerScopeFromOptions(options)),
+	      );
+	      const quotaExceeded = isClaudeQuotaError(rawErrorMessage);
+	      console.error('[ClaudeRuntime] Quick analysis failed:', errMsg);
       this.emitUpdate({
         type: 'error',
         content: {
@@ -2125,10 +2222,12 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
           `快速问答过程中出错: ${errMsg}`,
           `An error occurred during fast Q&A: ${errMsg}`,
         ),
-        confidence: 0,
-        rounds: 0,
-        totalDurationMs: Date.now() - startTime,
-      };
+	        confidence: 0,
+	        rounds: 0,
+	        totalDurationMs: Date.now() - startTime,
+	        terminationReason: quotaExceeded ? 'max_budget_usd' : 'execution_error',
+	        terminationMessage: errMsg,
+	      };
     } finally {
       this.activeAnalyses.delete(sessionId);
       try {

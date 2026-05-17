@@ -40,7 +40,7 @@ cp backend/.env.example backend/.env
 Both backend and frontend auto-rebuild on file save:
 
 - **Backend** (`tsx watch`): TypeScript changes take effect immediately
-- **Frontend** (`build.js --watch`): UI changes take effect on browser refresh
+- **Frontend** (`build.mjs --watch`): UI changes take effect on browser refresh
 - **Skills/Strategies** (`.yaml` / `.md`): Take effect on browser refresh
 
 You only need to restart if you change `.env` or run `npm install`:

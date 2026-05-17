@@ -237,6 +237,7 @@ describe('enterprise core schema', () => {
       'trace_label',
       'trace_metadata_json',
       'summary_json',
+      'conclusion_contract_json',
       'status',
       'schema_version',
       'created_at',
@@ -463,6 +464,7 @@ describe('enterprise core schema', () => {
       { version: 7 },
       { version: 8 },
       { version: 9 },
+      { version: 10 },
     ]);
   });
 

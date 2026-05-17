@@ -1363,7 +1363,7 @@ steps:
           *,
           CASE
             -- P0: Buffer Stuffing 管线背压 — 短路跳过线程分析
-            WHEN jank_responsibility = 'BUFFER_STUFFING'
+            WHEN '${jank_responsibility}' = 'BUFFER_STUFFING'
               THEN 'buffer_stuffing'
             -- P1: Binder 同步阻塞（特定可操作，阻塞可能占据 slice 大部分时间）
             WHEN slice_dur > slice_critical_ms
@@ -1476,7 +1476,7 @@ steps:
           END as primary_cause,
           CASE
             WHEN reason_code = 'buffer_stuffing' THEN
-              'Buffer Stuffing: 管线背压，帧耗时 ' || frame_dur_ms || 'ms，BufferQueue 积压导致跳帧（非 App 问题）'
+              'Buffer Stuffing: 管线背压，帧耗时 ' || ${dur_ms} || 'ms，BufferQueue 积压导致跳帧（非 App 问题）'
             WHEN reason_code = 'binder_sync_blocking' THEN
               'Binder 同步阻塞：关键操作与同步Binder重叠 ' || binder_overlap_ms || 'ms（累计 ' ||
               binder_sync_total_ms || 'ms' ||
@@ -1546,7 +1546,7 @@ steps:
           END as optimization_hint,
           reason_code,
           CASE
-            WHEN reason_code = 'buffer_stuffing' THEN 'Buffer Stuffing 管线背压（jank_type=' || jank_type || '）'
+            WHEN reason_code = 'buffer_stuffing' THEN 'Buffer Stuffing 管线背压（jank_type=${jank_type}）'
             WHEN reason_code = 'binder_sync_blocking' THEN '同步 Binder 重叠 ' || COALESCE(binder_overlap_ms, 0) || 'ms'
             WHEN reason_code = 'small_core_placement' THEN '关键操作小核占比 ' || COALESCE(top_slice_little_pct, 0) || '%'
             WHEN reason_code = 'sched_delay_in_slice' THEN '关键操作 Runnable 占比 ' || COALESCE(top_slice_runnable_pct, 0) || '%'

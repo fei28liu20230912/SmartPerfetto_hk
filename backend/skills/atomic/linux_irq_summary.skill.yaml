@@ -57,9 +57,9 @@ steps:
         ROUND(SUM(dur) / 1e6, 2) AS total_dur_ms,
         ROUND(AVG(dur) / 1e3, 1) AS avg_dur_us
       FROM (
-        SELECT name, dur FROM linux_hard_irqs
+        SELECT linux_hard_irqs.name AS name, linux_hard_irqs.dur AS dur FROM linux_hard_irqs
         UNION ALL
-        SELECT name, dur FROM linux_soft_irqs
+        SELECT linux_soft_irqs.name AS name, linux_soft_irqs.dur AS dur FROM linux_soft_irqs
       )
       GROUP BY name
       ORDER BY total_dur_ms DESC

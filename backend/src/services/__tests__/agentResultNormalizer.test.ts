@@ -3,6 +3,8 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import {
+  deriveConclusionContractForNarrative,
+  normalizeNarrativeForContract,
   normalizeNarrativeForClient,
   normalizeResultForReport,
 } from '../agentResultNormalizer';
@@ -46,6 +48,28 @@ describe('normalizeNarrativeForClient', () => {
   });
 });
 
+describe('deriveConclusionContractForNarrative', () => {
+  const narrativeWithEvClaim = [
+    '快速回答：帧耗时 45.6ms（ev_deadbeef1234）。',
+    '',
+    '## 逐句数据引用（结构化来源）',
+    '- Q1 / C1: 帧耗时 45.6ms',
+    '  - evidence_ref_id=ev_deadbeef1234; source_ref=表 1; row_index=0; column=dur_ms; value=45.6',
+  ].join('\n');
+
+  test('keeps evidence ids available for contract parsing before display sanitization', () => {
+    const display = normalizeNarrativeForClient(narrativeWithEvClaim);
+    expect(display).not.toContain('ev_deadbeef1234');
+
+    const contractSource = normalizeNarrativeForContract(narrativeWithEvClaim);
+    expect(contractSource).toContain('ev_deadbeef1234');
+
+    const contract = deriveConclusionContractForNarrative(narrativeWithEvClaim);
+    expect(contract?.claims?.[0]?.references?.[0]?.evidenceRefId).toBe('ev_deadbeef1234');
+    expect(contract?.claims?.[0]?.references?.[0]?.sourceRef).toBe('表 1');
+  });
+});
+
 describe('normalizeResultForReport', () => {
   test('returns input identity when nothing would change', () => {
     const r = makeResult({ conclusion: 'plain text', conclusionContract: { mode: 'focused_answer' } as any });
@@ -74,5 +98,21 @@ describe('normalizeResultForReport', () => {
     const r = makeResult({ conclusion: 'text', conclusionContract: contract });
     const out = normalizeResultForReport(r);
     expect(out.conclusionContract).toBe(contract);
+  });
+
+  test('derives claim provenance from unsanitized narrative while returning sanitized display text', () => {
+    const r = makeResult({
+      conclusion: [
+        '快速回答：帧耗时 45.6ms（ev_deadbeef1234）。',
+        '',
+        '## 逐句数据引用（结构化来源）',
+        '- Q1 / C1: 帧耗时 45.6ms',
+        '  - evidence_ref_id=ev_deadbeef1234; source_ref=表 1; row_index=0; column=dur_ms; value=45.6',
+      ].join('\n'),
+    });
+
+    const out = normalizeResultForReport(r);
+    expect(out.conclusion).not.toContain('ev_deadbeef1234');
+    expect(out.conclusionContract?.claims?.[0]?.references?.[0]?.evidenceRefId).toBe('ev_deadbeef1234');
   });
 });

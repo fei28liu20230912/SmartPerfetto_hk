@@ -27,7 +27,7 @@ describe('traceSummaryV2', () => {
       'COUNT(*) FROM process': {columns: ['c'], rows: [[42]]},
       'COUNT(*) FROM slice': {columns: ['c'], rows: [[10_000]]},
       actual_frame_timeline_slice: {columns: ['total', 'jank'], rows: [[600, 18]]},
-      'slice\n    ORDER BY dur DESC': {
+      'ORDER BY slice.dur DESC': {
         columns: ['name', 'dur'],
         rows: [
           ['Choreographer#doFrame', 10_000_000],
@@ -72,7 +72,7 @@ describe('traceSummaryV2', () => {
       'COUNT(*) FROM slice': {columns: ['c'], rows: [[1]]},
       // FrameTimeline probe returns no rows (simulating empty per_frame CTE).
       actual_frame_timeline_slice: {columns: ['total', 'jank'], rows: []},
-      'slice\n    ORDER BY dur DESC': {
+      'ORDER BY slice.dur DESC': {
         columns: ['name', 'dur'],
         rows: [['x', 1]],
       },

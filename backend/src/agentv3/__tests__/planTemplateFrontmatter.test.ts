@@ -75,6 +75,13 @@ describe('plan_template frontmatter pipeline', () => {
     }
   });
 
+  it('keeps Chrome scroll jank as a conditional hint, not a generic scrolling plan gate', () => {
+    const scrollingTpl = getScenePlanTemplate('scrolling');
+    expect(scrollingTpl).toBeDefined();
+    const ids = scrollingTpl!.mandatoryAspects.map(a => a.id);
+    expect(ids).not.toContain('chrome_scroll_jank');
+  });
+
   it('every registered scene resolves through dual-read without throwing', () => {
     for (const def of getRegisteredScenes()) {
       // Either frontmatter, or legacy fallback, or undefined (opt-out) — all OK.

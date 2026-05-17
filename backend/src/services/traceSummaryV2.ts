@@ -174,9 +174,9 @@ const PROBE_TOP_SLICES: ProbeSpec = {
   id: 'top_slices_by_dur',
   layer: 'L3',
   sql: `
-    SELECT name, dur
+    SELECT slice.name AS name, slice.dur AS dur
     FROM slice
-    ORDER BY dur DESC
+    ORDER BY slice.dur DESC
     LIMIT 5
   `,
   toMetrics: rows =>

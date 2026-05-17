@@ -8,16 +8,13 @@
  * `claudeMcpServer.ts` (Phase 4 of v2.1) so the algorithm can be unit
  * tested without standing up a full MCP server.
  *
- * Two-stage match, matching the behaviour Codex review F.3 documented:
+ * Match by weighted keyword overlap against the next phase's `name + goal`.
+ * Phase names are weighted higher than goals so a phase named "综合结论"
+ * is not stolen by goal text that happens to mention "根因/代表帧".
  *
- *   1. Keyword match against the next phase's `name + goal`. Wins
- *      whenever the agent named the phase using vocabulary that overlaps
- *      with any hint's `keywords`.
- *   2. Unconditional critical fallback. If keyword matching missed,
- *      inject the next `critical` hint that has not been covered by an
- *      already-finished phase. Critical hints (e.g. scrolling root-cause
- *      drill) are too important to skip just because the agent used a
- *      different name for the phase.
+ * Do not use an unconditional critical fallback here. Real e2e runs showed
+ * that fallback injecting root-cause reminders into identity/global-context
+ * phases is worse than omitting a reminder.
  */
 
 import type { PhaseHint } from './strategyLoader';
@@ -42,22 +39,33 @@ export function matchPhaseHintForNextPhase(input: {
   const { hints, nextPhase, finishedPhases } = input;
   if (hints.length === 0) return undefined;
 
-  const phaseText = `${nextPhase.name} ${nextPhase.goal ?? ''}`.toLowerCase();
+  const phaseName = nextPhase.name.toLowerCase();
+  const phaseGoal = (nextPhase.goal ?? '').toLowerCase();
 
-  const keywordMatch = hints.find(h =>
-    h.keywords.some(kw => phaseText.includes(kw.toLowerCase())),
-  );
-  if (keywordMatch) return keywordMatch;
+  const keywordWeight = (keyword: string): number => {
+    const normalized = keyword.trim();
+    if (normalized.length <= 1) return 0;
+    if (normalized.length <= 2) return 4;
+    return 6 + Math.min(normalized.length, 12);
+  };
 
-  const coveredHintIds = new Set<string>();
-  for (const phase of finishedPhases) {
-    if (phase.status !== 'completed' && phase.status !== 'skipped') continue;
-    const pText = `${phase.name} ${phase.summary ?? ''}`.toLowerCase();
-    for (const h of hints) {
-      if (h.keywords.some(kw => pText.includes(kw.toLowerCase()))) {
-        coveredHintIds.add(h.id);
-      }
+  const scoreHint = (hint: PhaseHint): number => {
+    let score = 0;
+    for (const keyword of hint.keywords) {
+      const kw = keyword.toLowerCase();
+      if (!kw) continue;
+      const weight = keywordWeight(kw);
+      if (phaseName.includes(kw)) score += weight * 5;
+      if (phaseGoal.includes(kw)) score += weight;
     }
-  }
-  return hints.find(h => h.critical && !coveredHintIds.has(h.id));
+    return score;
+  };
+
+  const keywordMatches = hints
+    .map((hint, index) => ({ hint, index, score: scoreHint(hint) }))
+    .filter(item => item.score > 0)
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+  if (keywordMatches.length > 0) return keywordMatches[0].hint;
+
+  return undefined;
 }

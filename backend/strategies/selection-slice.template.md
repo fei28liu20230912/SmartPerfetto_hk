@@ -105,22 +105,22 @@ FROM slice WHERE parent_id = {{eventId}}
 ORDER BY ts;
 
 -- 2) thread_state 调度状态（合并为一条查询，避免空查浪费）
-SELECT cpu, state, COUNT(*) AS cnt, SUM(dur)/1e6 AS total_ms
+SELECT thread_state.cpu, thread_state.state, COUNT(*) AS cnt, SUM(thread_state.dur)/1e6 AS total_ms
 FROM thread_state
-WHERE utid = (SELECT tt.utid FROM slice s JOIN thread_track tt ON s.track_id=tt.id WHERE s.id={{eventId}})
-  AND ts >= {{ts}} AND ts <= {{sliceEnd}}
-GROUP BY cpu, state ORDER BY total_ms DESC;
+WHERE thread_state.utid = (SELECT tt.utid FROM slice s JOIN thread_track tt ON s.track_id=tt.id WHERE s.id={{eventId}})
+  AND thread_state.ts >= {{ts}} AND thread_state.ts <= {{sliceEnd}}
+GROUP BY thread_state.cpu, thread_state.state ORDER BY total_ms DESC;
 -- ↑ 若返回 0 行，说明该时间段无 thread_state 数据，直接跳过调度分析
 
 -- 3) 历史同类 Slice 对比（判断异常）
-SELECT name, COUNT(*) AS cnt,
-       ROUND(AVG(dur)/1e6,2) AS avg_ms,
-       ROUND(MIN(dur)/1e6,2) AS min_ms,
-       ROUND(MAX(dur)/1e6,2) AS max_ms
-FROM slice
-WHERE track_id = (SELECT track_id FROM slice WHERE id = {{eventId}})
-  AND name LIKE '{{name}}%'
-GROUP BY name ORDER BY cnt DESC LIMIT 5;
+SELECT s.name AS slice_name, COUNT(*) AS cnt,
+       ROUND(AVG(s.dur)/1e6,2) AS avg_ms,
+       ROUND(MIN(s.dur)/1e6,2) AS min_ms,
+       ROUND(MAX(s.dur)/1e6,2) AS max_ms
+FROM slice s
+WHERE s.track_id = (SELECT track_id FROM slice WHERE id = {{eventId}})
+  AND s.name LIKE '{{name}}%'
+GROUP BY s.name ORDER BY cnt DESC LIMIT 5;
 ```
 > **关键**: 用 `parent_id` 遍历 Slice 层级，不要用 `track_id + ts BETWEEN`（后者经常返回空）。
 > 如果 thread_state 查询返回空，直接跳过——不要扩大时间窗口重试。

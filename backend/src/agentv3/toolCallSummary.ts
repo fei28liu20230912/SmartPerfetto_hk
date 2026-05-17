@@ -63,8 +63,9 @@ export function summarizeToolCallInput(toolName: string, input: unknown): ToolCa
     }
     case 'fetch_artifact': {
       const id = obj.artifactId ?? obj.id ?? '?';
-      const level = obj.level ?? '?';
-      return { inputSummary: `${id}@${level}`, paramsHash };
+      const detail = obj.detail ?? '?';
+      const purpose = typeof obj.purpose === 'string' ? ` ${shorten(obj.purpose)}` : '';
+      return { inputSummary: `${id}@${detail}${purpose}`, paramsHash };
     }
     default: {
       return { inputSummary: shorten(JSON.stringify(input)), paramsHash };

@@ -25,7 +25,7 @@
 - 安装 Perfetto UI 依赖。
 - 下载或构建 `trace_processor_shell`。
 - 启动 backend `tsx watch`。
-- 启动 Perfetto UI `build.js --watch`。
+- 启动 Perfetto UI `build.mjs --watch`。
 
 服务地址：
 

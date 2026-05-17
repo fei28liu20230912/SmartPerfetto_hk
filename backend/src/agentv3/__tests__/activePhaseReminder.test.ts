@@ -96,9 +96,9 @@ describe('buildActivePhaseReminder', () => {
     expect(reminder).toContain('查找泄漏');
   });
 
-  it('picks the first pending phase when no phase is in_progress', () => {
+  it('does not guess the current phase when no phase is in_progress', () => {
     const reminder = buildActivePhaseReminder(planAllPending, 'scrolling');
-    expect(reminder).toContain('概览采集');
+    expect(reminder).toBe('');
   });
 
   it('caps the rendered length so a busy fetch_artifact response stays compact', () => {

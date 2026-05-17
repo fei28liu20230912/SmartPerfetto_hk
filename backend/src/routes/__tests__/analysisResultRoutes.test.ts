@@ -59,6 +59,13 @@ function snapshot(overrides: Partial<AnalysisResultSnapshot>): AnalysisResultSna
     traceLabel: 'trace-a',
     traceMetadata: {},
     summary: { headline: 'ok' },
+    conclusionContract: {
+      claims: [{
+        id: 'Q1',
+        text: 'Startup total duration is 123ms',
+        references: [{ evidenceRefId: 'data:startup:summary', sourceRef: '表 1' }],
+      }],
+    },
     metrics: [{
       key: 'startup.total_ms',
       label: 'Startup total duration',
@@ -164,6 +171,20 @@ describe('analysis result routes', () => {
       'snapshot-a',
       'snapshot-b',
     ]);
+    expect(response.body.results[0]).not.toHaveProperty('conclusionContract');
+  });
+
+  test('returns full snapshot detail with conclusion contract on explicit read', async () => {
+    const response = await request(app())
+      .get('/api/workspaces/workspace-a/analysis-results/snapshot-a')
+      .set('x-tenant-id', DEFAULT_TENANT_ID)
+      .expect(200);
+
+    expect(response.body.success).toBe(true);
+    expect(response.body.snapshot.id).toBe('snapshot-a');
+    expect(response.body.snapshot.conclusionContract).toEqual(expect.objectContaining({
+      claims: [expect.objectContaining({ id: 'Q1' })],
+    }));
   });
 
   test('supports scene and trace filters without leaking other workspaces', async () => {

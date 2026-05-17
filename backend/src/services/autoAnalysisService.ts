@@ -51,7 +51,8 @@ class AutoAnalysisService {
           MAX(slice.ts + slice.dur) as launch_end,
           (MAX(slice.ts + slice.dur) - MIN(slice.ts)) / 1e6 as launch_duration_ms
         FROM slice
-        JOIN thread ON slice.utid = thread.utid
+        JOIN thread_track ON slice.track_id = thread_track.id
+        JOIN thread ON thread_track.utid = thread.utid
         JOIN process ON thread.upid = process.upid
         WHERE slice.name LIKE '%launch%' OR slice.name LIKE '%startActivity%'
         GROUP BY process.name
@@ -72,7 +73,8 @@ class AutoAnalysisService {
           thread.name as thread_name,
           process.name as process_name
         FROM slice
-        JOIN thread ON slice.utid = thread.utid
+        JOIN thread_track ON slice.track_id = thread_track.id
+        JOIN thread ON thread_track.utid = thread.utid
         JOIN process ON thread.upid = process.upid
         WHERE thread.name = 'main'
           AND slice.dur > 16666666  -- > 16.67ms (60fps)
@@ -93,10 +95,11 @@ class AutoAnalysisService {
           slice.dur / 1e6 as duration_ms,
           thread.name as thread_name,
           process.name as process_name,
-          EXTRACT_ARG(arg_set.arg_set_id, 'package') AS package_name,
-          EXTRACT_ARG(arg_set.arg_set_id, 'activity') AS activity
+          EXTRACT_ARG(slice.arg_set_id, 'package') AS package_name,
+          EXTRACT_ARG(slice.arg_set_id, 'activity') AS activity
         FROM slice
-        JOIN thread ON slice.utid = thread.utid
+        JOIN thread_track ON slice.track_id = thread_track.id
+        JOIN thread ON thread_track.utid = thread.utid
         JOIN process ON thread.upid = process.upid
         WHERE slice.name = 'ANR'
         ORDER BY slice.dur DESC
@@ -110,10 +113,11 @@ class AutoAnalysisService {
       sql: `
         SELECT
           COUNT(*) as alloc_count,
-          SUM(dur) / 1e6 as total_duration_ms,
-          thread.name
+          SUM(slice.dur) / 1e6 as total_duration_ms,
+          thread.name as thread_name
         FROM slice
-        JOIN thread ON slice.utid = thread.utid
+        JOIN thread_track ON slice.track_id = thread_track.id
+        JOIN thread ON thread_track.utid = thread.utid
         WHERE slice.name LIKE 'malloc%' OR slice.name LIKE 'new%'
         GROUP BY thread.name
         HAVING alloc_count > 100
@@ -129,10 +133,11 @@ class AutoAnalysisService {
         SELECT
           slice.name,
           COUNT(*) as count,
-          AVG(dur) / 1e6 as avg_duration_ms,
+          AVG(slice.dur) / 1e6 as avg_duration_ms,
           thread.name as thread_name
         FROM slice
-        JOIN thread ON slice.utid = thread.utid
+        JOIN thread_track ON slice.track_id = thread_track.id
+        JOIN thread ON thread_track.utid = thread.utid
         WHERE slice.name LIKE '%draw%'
           OR slice.name LIKE '%layout%'
           OR slice.name LIKE '%measure%'
@@ -152,11 +157,12 @@ class AutoAnalysisService {
           slice.name,
           slice.ts,
           slice.dur / 1e6 as duration_ms,
-          EXTRACT_ARG(arg_set.arg_set_id, 'url') AS url,
+          EXTRACT_ARG(slice.arg_set_id, 'url') AS url,
           thread.name as thread_name
         FROM slice
-        JOIN thread ON slice.utid = thread.utid
-        WHERE slice.name LIKE '%http%' OR slice.name LIKE '%network%'
+        JOIN thread_track ON slice.track_id = thread_track.id
+        JOIN thread ON thread_track.utid = thread.utid
+        WHERE (slice.name LIKE '%http%' OR slice.name LIKE '%network%')
           AND slice.dur > 1000000000  -- > 1 second
         ORDER BY slice.dur DESC
         LIMIT 20
@@ -367,11 +373,12 @@ class AutoAnalysisService {
       // 获取总览统计
       const statsQuery = `
         SELECT
-          COUNT(DISTINCT slice.utid) as unique_threads,
+          COUNT(DISTINCT thread_track.utid) as unique_threads,
           COUNT(DISTINCT thread.upid) as unique_processes,
           COUNT(*) as total_slices
         FROM slice
-        LEFT JOIN thread ON slice.utid = thread.utid
+        LEFT JOIN thread_track ON slice.track_id = thread_track.id
+        LEFT JOIN thread ON thread_track.utid = thread.utid
       `;
 
       const statsResult = typeof legacyQuery === 'function'
@@ -409,7 +416,8 @@ class AutoAnalysisService {
     const launchQuery = `
       SELECT slice.name, slice.ts, slice.dur, process.name as process_name
       FROM slice
-      JOIN thread ON slice.utid = thread.utid
+      JOIN thread_track ON slice.track_id = thread_track.id
+      JOIN thread ON thread_track.utid = thread.utid
       JOIN process ON thread.upid = process.upid
       WHERE slice.ts BETWEEN ${startTime} AND ${endTime}
         AND (slice.name LIKE '%launch%' OR slice.name LIKE '%startActivity%')
@@ -484,7 +492,8 @@ class AutoAnalysisService {
         MIN(slice.ts) as first_seen,
         MAX(slice.ts + slice.dur) as last_seen
       FROM slice
-      JOIN thread ON slice.utid = thread.utid
+      JOIN thread_track ON slice.track_id = thread_track.id
+      JOIN thread ON thread_track.utid = thread.utid
       JOIN process ON thread.upid = process.upid
       WHERE slice.ts BETWEEN ${startTime} AND ${endTime}
         AND process.name IS NOT NULL

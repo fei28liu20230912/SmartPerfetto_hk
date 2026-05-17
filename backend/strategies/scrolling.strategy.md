@@ -68,6 +68,11 @@ phase_hints:
     constraints: '需要帧内 CPU/UI/GPU/阻塞调用细分时，优先用 frame_overrun_summary、cpu_time_per_frame、frame_ui_time_breakdown、frame_blocking_calls、android_gpu_work_period_track、mali_gpu_power_state 作为补充证据。缺 gpu_work_period 时必须标注数据不足。'
     critical_tools: ['frame_overrun_summary', 'cpu_time_per_frame', 'frame_ui_time_breakdown', 'frame_blocking_calls', 'android_gpu_work_period_track', 'mali_gpu_power_state']
     critical: false
+  - id: missing_frame_gap
+    keywords: ['缺帧', 'gap', 'frame_production_gap', '帧间', 'production gap', '隐形缺帧']
+    constraints: '只有满足缺帧触发条件时才调用 frame_production_gap；如果 real_jank_count 足够、Buffer Stuffing 假阳性低且非 WebView/SurfaceTexture，要记录触发条件并跳过，不要重复要求 scrolling_analysis。'
+    critical_tools: ['frame_production_gap']
+    critical: false
   - id: chrome_scroll_jank
     keywords: ['Chrome', 'Chromium', 'WebView', 'scroll jank v4', 'preferred frame timeline', 'ChromeScrollJank']
     constraints: '当 trace 明确来自 Chrome/Chromium/WebView 或用户提到 Chrome scroll jank 时，调用 chrome_scroll_jank_frame_timeline。若返回 no_chrome_scroll_data，只能说明缺少 Chrome scroll instrumentation，不要把 Android app FrameTimeline 当作 Chrome scroll jank 证据。'
@@ -95,9 +100,6 @@ plan_template:
     - id: architecture_specific_jank
       match_keywords: ['TextureView', 'SurfaceTexture', 'WebView', 'DrawFunctor', 'React Native', 'RN', 'Fabric', 'JSI', 'GLSurfaceView', 'NativeActivity', 'OpenGL', 'Compose', 'Flutter', 'mixed', '混合', '架构']
       suggestion: '非标准/混合渲染架构必须拆成 HWUI host 链路 + producer 链路 + SF 合成链路分别分析，再合并因果，避免只看 FrameTimeline'
-    - id: chrome_scroll_jank
-      match_keywords: ['Chrome', 'Chromium', 'WebView', 'scroll jank v4', 'preferred frame timeline', 'ChromeScrollJank']
-      suggestion: 'Chrome/WebView 滑动需要优先检查 chrome_scroll_jank_frame_timeline 的 v3/v4 scroll jank 与 preferred frame timeline availability'
 ---
 
 **Android 版本注意**：
@@ -269,6 +271,8 @@ invoke_skill("scrolling_analysis", { start_ts: "<trace_start>", end_ts: "<trace_
 - 如果 `big_avg_freq_mhz >= device_peak_freq_mhz * 0.70`：确认为纯负载问题，优化方向纯 [App层]
 - 计算公式：实际运行频率占比 = `big_avg_freq_mhz / device_peak_freq_mhz`，低于 70% 需标注
 - **在结论的代表帧分析中必须报告频率数据**：`大核均频 XXMHz / 设备峰值 YYMHz (ZZ%)`
+- 不要用 `execute_sql` 从 `actual_frame_timeline_slice` 查询 `big_avg_freq_mhz`、`device_peak_freq_mhz` 或 `cpu_freq_clusters_json`；这些是 `batch_frame_root_cause` 的派生结果，不是 FrameTimeline 原生列。
+- 不要把 `batch_frame_root_cause`、`__intrinsic_batch_frame_root_cause` 或任何 skill step/save_as 名称当作 SQL 表查询；它们是 Skill Artifact。需要读取这些字段时，用 `fetch_artifact` 分页获取对应 artifact。
 
 **WHY 链深度要求：** 每个 [CRITICAL]/[HIGH] 发现的根因推理链必须至少 2 级：
 - ✅ Level 1: "帧超时" → Level 2: "Binder 阻塞" → Level 3: "服务端 system_server monitor_contention"

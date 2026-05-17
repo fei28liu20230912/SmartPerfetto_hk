@@ -11,7 +11,7 @@ import { getTraceProcessorService } from '../services/traceProcessorService';
 import path from 'path';
 
 async function diagnose() {
-  const tracePath = path.join(process.cwd(), '../test-traces/app_aosp_scrolling_heavy_jank.pftrace');
+  const tracePath = path.join(process.cwd(), '../test-traces/scroll-demo-customer-scroll.pftrace');
   console.log('Trace:', path.basename(tracePath));
   console.log('Size:', (require('fs').statSync(tracePath).size / 1024 / 1024).toFixed(2), 'MB\n');
 

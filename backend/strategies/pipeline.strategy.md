@@ -90,45 +90,44 @@ list_skills(type="pipeline")
 通过手动查询关键 Slice 模式来确认/修正管线类型：
 ```sql
 -- 检查 HWUI 标准管线特征
-SELECT name, COUNT(*) as cnt
-FROM slice
-WHERE name IN ('DrawFrame', 'syncFrameState', 'Choreographer#doFrame', 'dequeueBuffer', 'queueBuffer')
-GROUP BY name
+SELECT s.name AS slice_name, COUNT(*) AS cnt
+FROM slice s
+WHERE s.name IN ('DrawFrame', 'syncFrameState', 'Choreographer#doFrame', 'dequeueBuffer', 'queueBuffer')
+GROUP BY s.name
 ORDER BY cnt DESC
 ```
 
 ```sql
 -- 检查 Flutter 特征
-SELECT t.name AS thread_name, COUNT(*) as slice_cnt
-FROM slice s
-JOIN thread t ON s.track_id = t.utid
-WHERE t.name IN ('1.ui', '1.raster', '1.io', 'io.flutter.1.ui', 'io.flutter.1.raster')
-GROUP BY t.name
+SELECT thread_name, COUNT(*) AS slice_cnt
+FROM thread_slice
+WHERE thread_name IN ('1.ui', '1.raster', '1.io', 'io.flutter.1.ui', 'io.flutter.1.raster')
+GROUP BY thread_name
 ```
 
 ```sql
 -- 检查 WebView 特征
-SELECT name, COUNT(*) as cnt
-FROM slice
-WHERE name GLOB '*CrRendererMain*'
-   OR name GLOB '*WebViewChromium*'
-   OR name GLOB '*GLFunctor*'
-   OR name GLOB '*viz::*'
-GROUP BY name
+SELECT s.name AS slice_name, COUNT(*) AS cnt
+FROM slice s
+WHERE s.name GLOB '*CrRendererMain*'
+   OR s.name GLOB '*WebViewChromium*'
+   OR s.name GLOB '*GLFunctor*'
+   OR s.name GLOB '*viz::*'
+GROUP BY s.name
 ORDER BY cnt DESC
 LIMIT 10
 ```
 
 ```sql
 -- 检查 Game Engine 特征
-SELECT name, COUNT(*) as cnt
-FROM slice
-WHERE name GLOB '*UnityMain*'
-   OR name GLOB '*UnityGfx*'
-   OR name GLOB '*UE4*'
-   OR name GLOB '*GameThread*'
-   OR name GLOB '*RHIThread*'
-GROUP BY name
+SELECT s.name AS slice_name, COUNT(*) AS cnt
+FROM slice s
+WHERE s.name GLOB '*UnityMain*'
+   OR s.name GLOB '*UnityGfx*'
+   OR s.name GLOB '*UE4*'
+   OR s.name GLOB '*GameThread*'
+   OR s.name GLOB '*RHIThread*'
+GROUP BY s.name
 ORDER BY cnt DESC
 LIMIT 10
 ```
@@ -168,14 +167,13 @@ LIMIT 10
 
 ```sql
 -- 检测多 RenderThread
-SELECT t.name, t.tid, COUNT(s.id) as slice_cnt
-FROM slice s
-JOIN thread t ON s.track_id = t.utid
-WHERE t.name GLOB 'RenderThread*'
-   OR t.name GLOB '1.raster*'
-   OR t.name GLOB 'CrRendererMain*'
-   OR t.name GLOB 'GLThread*'
-GROUP BY t.name, t.tid
+SELECT thread_name, tid, COUNT(*) AS slice_cnt
+FROM thread_slice
+WHERE thread_name GLOB 'RenderThread*'
+   OR thread_name GLOB '1.raster*'
+   OR thread_name GLOB 'CrRendererMain*'
+   OR thread_name GLOB 'GLThread*'
+GROUP BY thread_name, tid
 ORDER BY slice_cnt DESC
 ```
 

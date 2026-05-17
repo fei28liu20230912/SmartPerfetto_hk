@@ -6,6 +6,8 @@ import { DEFAULT_OUTPUT_LANGUAGE, localize, type OutputLanguage } from './output
 
 const MCP_PREFIX = 'mcp__smartperfetto__';
 const MAX_MESSAGE_CHARS = 220;
+const MAX_PLAN_MESSAGE_CHARS = 560;
+const MAX_SQL_MESSAGE_CHARS = 300;
 
 function asRecord(value: unknown): Record<string, unknown> {
   if (typeof value === 'string') {
@@ -74,8 +76,15 @@ function paramSummary(params: unknown): string {
 }
 
 function phaseSummary(phases: Record<string, unknown>[]): string {
-  return phases
-    .slice(0, 4)
+  const conclusionPhases = phases.filter(isConclusionLikePhase);
+  const orderedPhases = conclusionPhases.length > 0
+    ? [
+        ...phases.filter(phase => !isConclusionLikePhase(phase)),
+        ...conclusionPhases,
+      ]
+    : phases;
+
+  return orderedPhases
     .map((phase) => {
       const id = readString(phase.id);
       const name = readString(phase.name);
@@ -85,6 +94,78 @@ function phaseSummary(phases: Record<string, unknown>[]): string {
     })
     .filter(Boolean)
     .join('；');
+}
+
+function isConclusionLikePhase(phase: Record<string, unknown>): boolean {
+  const text = [
+    readString(phase.id),
+    readString(phase.name),
+    readString(phase.goal),
+  ].join(' ').toLowerCase();
+  return /(综合结论|最终结论|结论输出|输出结论|输出最终报告|最终报告|综合报告|final conclusion|conclusion|final report|write final answer)/i
+    .test(text);
+}
+
+function leadingSqlComment(sql: string): string {
+  const lines = sql
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+  const comments: string[] = [];
+  for (const line of lines) {
+    const match = line.match(/^--\s*(.+)$/);
+    if (!match) break;
+    comments.push(match[1].trim());
+  }
+  return comments.join('；');
+}
+
+function quotedSqlTerms(sql: string, max = 3): string[] {
+  const terms = new Set<string>();
+  const pattern = /\b(?:GLOB|LIKE|=)\s*'([^']{2,80})'/gi;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(sql)) && terms.size < max) {
+    const cleaned = match[1].replace(/[*%]/g, '').trim();
+    if (cleaned) terms.add(cleaned);
+  }
+  return [...terms];
+}
+
+function sqlIntent(sql: string, language: OutputLanguage): string {
+  const comment = leadingSqlComment(sql);
+  if (comment) return comment;
+
+  const lower = sql.toLowerCase();
+  const terms = quotedSqlTerms(sql);
+  const termText = terms.length > 0
+    ? localize(language, `（过滤: ${terms.join(', ')}）`, ` (filters: ${terms.join(', ')})`)
+    : '';
+
+  if (/actual_frame_timeline_slice/.test(lower) &&
+    /min\s*\(\s*ts\s*\)/.test(lower) &&
+    /max\s*\(\s*ts\s*\+\s*dur\s*\)/.test(lower)) {
+    return localize(language, '获取 FrameTimeline 的 Trace 时间边界和帧数量', 'get FrameTimeline trace time bounds and frame count');
+  }
+  if (/actual_frame_timeline|expected_frame_timeline/.test(lower) && /jank/.test(lower)) {
+    return localize(language, `统计帧耗时、掉帧类型和 FrameTimeline 证据${termText}`, `summarize frame duration, jank type, and FrameTimeline evidence${termText}`);
+  }
+  if (/\bthread_state\b/.test(lower)) {
+    return localize(language, `验证目标时间窗内线程 Running/Sleeping/IO 等状态分布${termText}`, `verify thread-state distribution such as Running/Sleeping/IO in the target window${termText}`);
+  }
+  if (/\bthread_slice\b|\bslice\b/.test(lower) && /webview|chromium|v8|crrenderermain|parsehtml|layout|drawgl/.test(lower)) {
+    return localize(language, `验证 WebView/Chromium/V8 相关 slice 耗时和线程归属${termText}`, `verify WebView/Chromium/V8 slice duration and thread ownership${termText}`);
+  }
+  if (/\bthread_slice\b/.test(lower) && /self_dur|dur|order\s+by/.test(lower)) {
+    return localize(language, `定位目标线程或进程内的热点 slice 耗时${termText}`, `find hot slice durations in the target thread or process${termText}`);
+  }
+  if (/\bsched_slice\b|\bcpu_counter_track\b|\bcounter\b/.test(lower)) {
+    return localize(language, `验证 CPU 调度、频率或计数器数据${termText}`, `verify CPU scheduling, frequency, or counter data${termText}`);
+  }
+
+  const hint = sqlTableHint(sql, language);
+  return hint
+    ? localize(language, `查询 ${hint} 来验证具体数据${termText}`, `query ${hint} to verify specific data${termText}`)
+    : localize(language, '补充验证 Skill 未直接覆盖的数据', 'verify data not directly covered by a Skill');
 }
 
 function sqlTableHint(sql: string, language: OutputLanguage): string {
@@ -137,6 +218,22 @@ function skillPurpose(skillId: string, language: OutputLanguage): string {
       zh: '下钻单帧卡顿的执行链路和根因线索',
       en: 'drill into one janky frame and its root-cause clues',
     },
+    frame_blocking_calls: {
+      zh: '检查卡顿帧内与主线程/渲染线程重叠的阻塞调用',
+      en: 'inspect blocking calls overlapping the UI and render threads in janky frames',
+    },
+    lock_binder_wait: {
+      zh: '下钻主线程锁等待、Binder 等待和唤醒链证据',
+      en: 'drill into main-thread lock waits, Binder waits, and waker-chain evidence',
+    },
+    frame_production_gap: {
+      zh: '检测帧生产链路缺口，确认 UI、RenderThread 或 SF 哪一段没有产出帧',
+      en: 'detect frame production gaps and localize whether UI, RenderThread, or SF missed output',
+    },
+    batch_frame_root_cause: {
+      zh: '批量分类掉帧根因，统计各 reason_code 占比和代表帧',
+      en: 'classify janky-frame root causes in bulk and summarize reason-code distribution',
+    },
     process_identity_resolver: {
       zh: '确认目标进程/包名，避免查错进程',
       en: 'resolve the target process/package to avoid querying the wrong process',
@@ -148,7 +245,7 @@ function skillPurpose(skillId: string, language: OutputLanguage): string {
     [/binder/, { zh: '分析 Binder 调用、阻塞和跨进程延迟', en: 'analyze Binder calls, blocking, and IPC latency' }],
     [/sched|cpu/, { zh: '分析 CPU 调度、Runnable 等待和大小核分配', en: 'analyze CPU scheduling, runnable waits, and core placement' }],
     [/memory|lmk|gc/, { zh: '分析内存、GC 或 LMK 压力', en: 'analyze memory, GC, or LMK pressure' }],
-    [/io|file|database/, { zh: '分析 I/O、文件或数据库耗时', en: 'analyze I/O, file, or database latency' }],
+    [/(^|_)(io|file|database)(_|$)/, { zh: '分析 I/O、文件或数据库耗时', en: 'analyze I/O, file, or database latency' }],
     [/thermal|power|battery|wattson/, { zh: '分析温度、功耗或电池相关证据', en: 'analyze thermal, power, or battery evidence' }],
     [/frame|jank|scroll|choreographer/, { zh: '分析帧渲染和卡顿相关证据', en: 'analyze frame rendering and jank evidence' }],
   ];
@@ -174,7 +271,8 @@ export function formatToolCallNarration(
       const detail = summary || objective;
       return shorten(detail
         ? localize(language, `制定分析计划：${detail}`, `Create analysis plan: ${detail}`)
-        : localize(language, '制定分析计划：明确要收集的证据和验证顺序', 'Create analysis plan: define evidence and validation order'));
+        : localize(language, '制定分析计划：明确要收集的证据和验证顺序', 'Create analysis plan: define evidence and validation order'),
+      MAX_PLAN_MESSAGE_CHARS);
     }
     case 'update_plan_phase': {
       const phaseId = readString(args.phaseId || args.id) || 'phase';
@@ -207,19 +305,68 @@ export function formatToolCallNarration(
     }
     case 'execute_sql': {
       const sql = readString(args.sql);
-      const hint = sqlTableHint(sql, language);
-      return shorten(hint
-        ? localize(language, `执行 SQL：查询 ${hint} 来验证具体数据`, `Run SQL: query ${hint} to verify specific data`)
-        : localize(language, '执行 SQL：补充验证 Skill 未直接覆盖的数据', 'Run SQL: verify data not directly covered by a Skill'));
+      const intent = sqlIntent(sql, language);
+      return shorten(localize(language, `执行 SQL：${intent}`, `Run SQL: ${intent}`), MAX_SQL_MESSAGE_CHARS);
+    }
+    case 'execute_sql_on': {
+      const trace = readString(args.trace) || 'current';
+      const sql = readString(args.sql);
+      const intent = sqlIntent(sql, language);
+      const traceLabel = trace === 'reference'
+        ? localize(language, '参考 Trace', 'reference trace')
+        : localize(language, '当前 Trace', 'current trace');
+      return shorten(
+        localize(language, `执行对比 SQL：在${traceLabel}${intent}，验证两条 Trace 的差异`, `Run comparison SQL on the ${traceLabel}: ${intent}; verify trace differences`),
+        MAX_SQL_MESSAGE_CHARS,
+      );
+    }
+    case 'compare_skill': {
+      const skillId = readString(args.skillId) || readString(args.skill) || 'unknown_skill';
+      const purpose = skillPurpose(skillId, language);
+      const params = paramSummary(args.params);
+      const paramsText = params
+        ? localize(language, `；参数：${params}`, `; params: ${params}`)
+        : '';
+      return shorten(localize(
+        language,
+        `对比 Skill ${skillId}：在当前 Trace 和参考 Trace 上同时${purpose}${paramsText}`,
+        `Compare Skill ${skillId}: ${purpose} on both current and reference traces${paramsText}`,
+      ));
+    }
+    case 'get_comparison_context':
+      return localize(
+        language,
+        '读取对比上下文：确认当前 Trace 和参考 Trace 的应用、设备和能力是否可比',
+        'Read comparison context: check app, device, and capability alignment for both traces',
+      );
+    case 'resolve_hypothesis': {
+      const status = readString(args.status) || readString(args.resolution);
+      const evidence = readString(args.evidence || args.reason || args.summary);
+      return shorten(evidence
+        ? localize(language, `收敛假设为 ${status || 'resolved'}：${evidence}`, `Resolve hypothesis as ${status || 'resolved'}: ${evidence}`)
+        : localize(language, `收敛假设为 ${status || 'resolved'}：根据已收集证据更新判断`, `Resolve hypothesis as ${status || 'resolved'}: update judgment from collected evidence`));
+    }
+    case 'flag_uncertainty': {
+      const reason = readString(args.reason || args.description);
+      return shorten(reason
+        ? localize(language, `标记不确定性：${reason}`, `Flag uncertainty: ${reason}`)
+        : localize(language, '标记不确定性：说明当前结论还缺哪类证据', 'Flag uncertainty: note which evidence is still missing'));
     }
     case 'fetch_artifact': {
       const artifactId = readString(args.artifactId || args.id) || '?';
       const detail = readString(args.detail || args.level) || 'rows';
-      return localize(
-        language,
-        `读取 artifact ${artifactId} 的 ${detail} 详情：展开前面 Skill 的完整数据`,
-        `Fetch ${detail} details from artifact ${artifactId}: expand full data from a previous Skill`,
-      );
+      const purpose = readString(args.purpose || args.reason || args.why);
+      return shorten(purpose
+        ? localize(
+          language,
+          `读取 artifact ${artifactId} 的 ${detail} 详情：${purpose}`,
+          `Fetch ${detail} details from artifact ${artifactId}: ${purpose}`,
+        )
+        : localize(
+          language,
+          `读取 artifact ${artifactId} 的 ${detail} 详情：核对前面 Skill 生成的完整证据行`,
+          `Fetch ${detail} details from artifact ${artifactId}: inspect full evidence rows from a previous Skill`,
+        ));
     }
     case 'list_skills':
       return localize(language, '查询可用 Skill 列表：选择合适的数据采集工具', 'List available Skills: choose an evidence collection tool');
@@ -242,6 +389,12 @@ export function formatToolCallNarration(
       return shorten(keyword
         ? localize(language, `搜索 Perfetto 源码：${keyword}`, `Search Perfetto source: ${keyword}`)
         : localize(language, '搜索 Perfetto 源码：确认表/函数的官方语义', 'Search Perfetto source: confirm official table/function semantics'));
+    }
+    case 'lookup_knowledge': {
+      const topic = readString(args.topic || args.query || args.keyword);
+      return shorten(topic
+        ? localize(language, `读取知识库：${topic}，用于校准当前诊断解释`, `Read knowledge base: ${topic} to calibrate the diagnosis`)
+        : localize(language, '读取知识库：校准当前诊断解释', 'Read knowledge base: calibrate the current diagnosis'));
     }
     default:
       return shorten(localize(language, `调用工具 ${toolName}`, `Call tool ${toolName}`));

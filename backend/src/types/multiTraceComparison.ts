@@ -194,6 +194,7 @@ export interface AnalysisResultSnapshot {
   traceLabel: string;
   traceMetadata: TraceComparisonMetadata;
   summary: AnalysisSummary;
+  conclusionContract?: unknown;
   metrics: NormalizedMetricValue[];
   evidenceRefs: EvidenceRef[];
   status: AnalysisResultSnapshotStatus;

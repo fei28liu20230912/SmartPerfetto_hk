@@ -186,11 +186,11 @@ steps:
   - id: runnable_analysis
     type: atomic
     sql: |
-      SELECT utid, thread.name, SUM(dur)/1e6 AS runnable_ms
+      SELECT thread_state.utid, thread.name AS thread_name, SUM(thread_state.dur)/1e6 AS runnable_ms
       FROM thread_state
       JOIN thread USING (utid)
-      WHERE state = 'R'
-      GROUP BY utid
+      WHERE thread_state.state = 'R'
+      GROUP BY thread_state.utid, thread.name
       ORDER BY runnable_ms DESC
       LIMIT 20
     save_as: runnable_data
@@ -454,8 +454,8 @@ steps:
     name: "分析关键阶段"
     for_each: startups
     sql: |
-      SELECT name, dur/1e6 as dur_ms,
-             (ts - (SELECT ts FROM android_startups WHERE startup_id = ${item.startup_id}))/1e6 as relative_ms
+      SELECT s.name AS slice_name, s.dur/1e6 AS dur_ms,
+             (s.ts - (SELECT ts FROM android_startups WHERE startup_id = ${item.startup_id}))/1e6 AS relative_ms
       FROM slice s
       JOIN thread_track tt ON s.track_id = tt.id
       JOIN thread t ON tt.utid = t.utid
@@ -570,9 +570,9 @@ steps:
   - id: check_coloros_boost
     name: "检查 ColorOS 加速引擎"
     sql: |
-      SELECT name, dur/1e6 as dur_ms
-      FROM slice
-      WHERE name GLOB '*ColorOS*' OR name GLOB '*HyperBoost*'
+      SELECT s.name AS slice_name, s.dur/1e6 AS dur_ms
+      FROM slice s
+      WHERE s.name GLOB '*ColorOS*' OR s.name GLOB '*HyperBoost*'
 
 # 覆盖阈值（OPPO 设备可能有更好的优化）
 thresholds:

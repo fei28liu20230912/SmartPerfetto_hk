@@ -73,6 +73,49 @@ describe('dataContract column inference', () => {
     expect(validateDataEnvelope(env)).toEqual([]);
   });
 
+  it('keeps stable evidence and trace metadata on created envelopes', () => {
+    const env = createDataEnvelope(
+      {columns: ['value'], rows: [[1]]},
+      {
+        type: 'sql_result',
+        source: 'execute_sql',
+        title: 'Rows',
+        evidenceRefId: 'data:sql:current:trace_hash:query_hash',
+        traceSide: 'current',
+        traceId: 'trace-a',
+        queryHash: 'query_hash',
+        sourceToolCallId: 'execute_sql:1:params_hash',
+        paramsHash: 'params_hash',
+        planPhaseId: 'phase-1',
+        planPhaseTitle: 'Collect evidence',
+        planPhaseGoal: 'Query frame stats',
+        planPhaseAttribution: 'active',
+        planPhaseWarning: 'phase matched',
+        toolNarration: '执行 SQL：查询帧数据',
+        producerReason: '验证本阶段帧耗时数据',
+        intent: 'ad_hoc_sql_verification',
+      },
+    );
+
+    expect(env.meta).toEqual(expect.objectContaining({
+      evidenceRefId: 'data:sql:current:trace_hash:query_hash',
+      traceSide: 'current',
+      traceId: 'trace-a',
+      queryHash: 'query_hash',
+      sourceToolCallId: 'execute_sql:1:params_hash',
+      paramsHash: 'params_hash',
+      planPhaseId: 'phase-1',
+      planPhaseTitle: 'Collect evidence',
+      planPhaseGoal: 'Query frame stats',
+      planPhaseAttribution: 'active',
+      planPhaseWarning: 'phase matched',
+      toolNarration: '执行 SQL：查询帧数据',
+      producerReason: '验证本阶段帧耗时数据',
+      intent: 'ad_hoc_sql_verification',
+    }));
+    expect(validateDataEnvelope(env)).toEqual([]);
+  });
+
   it('sanitizes invalid explicit column definitions before DataEnvelope output', () => {
     const columns = buildColumnDefinitions(['ts', 'value'], [
       {

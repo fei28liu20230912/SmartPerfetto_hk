@@ -38,8 +38,8 @@ const E2E_TIMEOUT = 180000; // 3 minutes
 const SSE_TIMEOUT = 120000; // 2 minutes for SSE collection
 
 // Test traces
-const SCROLLING_TRACE = 'app_aosp_scrolling_heavy_jank.pftrace';
-const STARTUP_TRACE = 'app_start_heavy.pftrace';
+const SCROLLING_TRACE = 'scroll-demo-customer-scroll.pftrace';
+const STARTUP_TRACE = 'lacunh_heavy.pftrace';
 
 // =============================================================================
 // Types for Test Assertions

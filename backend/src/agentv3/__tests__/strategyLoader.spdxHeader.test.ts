@@ -19,7 +19,7 @@
  */
 
 import { describe, it, expect, beforeAll } from '@jest/globals';
-import { getRegisteredScenes, getStrategyContent, getPhaseHints, invalidateStrategyCache } from '../strategyLoader';
+import { getRegisteredScenes, getStrategyContent, getPhaseHints, invalidateStrategyCache, loadPromptTemplate } from '../strategyLoader';
 
 describe('strategyLoader tolerates leading SPDX HTML comments', () => {
   beforeAll(() => {
@@ -50,5 +50,21 @@ describe('strategyLoader tolerates leading SPDX HTML comments', () => {
   it('returns empty phase_hints array for scenes without hints', () => {
     expect(getPhaseHints('general')).toEqual([]);
     expect(getPhaseHints('memory')).toEqual([]);
+  });
+
+  it('keeps the AgentV3 output template wired for machine-parseable claim provenance', () => {
+    const content = loadPromptTemplate('prompt-output-format');
+    expect(content).toContain('## 逐句数据引用（结构化来源）');
+    expect(content).toContain('evidence_ref_id=<data:* 或 ev_* 证据 ID>');
+    expect(content).toContain('source_tool_call_id=<工具调用 ID，如可见>');
+    expect(content).toContain('row_index=<0-based 行号，如可见>');
+  });
+
+  it('keeps the quick prompt wired for machine-parseable claim provenance', () => {
+    const content = loadPromptTemplate('prompt-quick');
+    expect(content).toContain('## 逐句数据引用（结构化来源）');
+    expect(content).toContain('evidence_ref_id=<data:* 或 ev_* 证据 ID>');
+    expect(content).toContain('source_ref=<表 1/摘要 1>');
+    expect(content).toContain('column=<列名>; value=<原始值>');
   });
 });

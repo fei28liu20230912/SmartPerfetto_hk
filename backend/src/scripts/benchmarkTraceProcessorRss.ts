@@ -145,10 +145,10 @@ const DEFAULT_QUERIES: QuerySpec[] = [
   {
     name: 'top_slice_durations',
     sql: `
-      SELECT name, COUNT(*) AS count, SUM(dur) AS total_dur
+      SELECT slice.name AS name, COUNT(*) AS count, SUM(slice.dur) AS total_dur
       FROM slice
-      WHERE dur > 0
-      GROUP BY name
+      WHERE slice.dur > 0
+      GROUP BY slice.name
       ORDER BY total_dur DESC
       LIMIT 20;
     `,

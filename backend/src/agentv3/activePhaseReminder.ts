@@ -32,8 +32,8 @@ export const REMINDER_PREFIX = '\n\n[计划提醒]';
 
 /**
  * Render the active-phase reminder string. Returns an empty string
- * when there is nothing useful to inject (no plan, no in-progress /
- * pending phase, or the scene has no phase_hints configured).
+ * when there is nothing useful to inject (no plan, no explicit in-progress
+ * phase, or the scene has no phase_hints configured).
  *
  * Pure function: takes the plan + sceneType and returns a string.
  */
@@ -43,9 +43,7 @@ export function buildActivePhaseReminder(
 ): string {
   if (!plan || !sceneType) return '';
 
-  const activePhase = plan.phases.find(
-    p => p.status === 'in_progress' || p.status === 'pending',
-  );
+  const activePhase = plan.phases.find(p => p.status === 'in_progress');
   if (!activePhase) return '';
 
   const hints = getPhaseHints(sceneType);

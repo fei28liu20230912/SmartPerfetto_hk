@@ -383,6 +383,23 @@ clusters: S1: 初始化阶段（3帧, 75%）
       evidence_chain: [
         { conclusion_id: 'C1', evidence: ['逐帧根因显示主线程耗时占比65%（ev_111111111111）'] },
       ],
+      claims: [
+        {
+          id: 'Q1',
+          conclusion_id: 'C1',
+          text: '主线程耗时占比65%',
+          references: [
+            {
+              evidence_ref_id: 'data:sql_table:current:trace-1:query-a:params-a',
+              source_ref: '表 1',
+              source_tool_call_id: 'execute_sql:1:params-a',
+              row_index: 0,
+              column: 'main_thread_pct',
+              value: 65,
+            },
+          ],
+        },
+      ],
       uncertainties: ['主线程休眠占比与占用时间口径存在差异'],
       next_steps: ['对K1聚类下钻：分析 Choreographer#doFrame 耗时点'],
       metadata: { confidence: 83, rounds: 3 },
@@ -393,10 +410,74 @@ clusters: S1: 初始化阶段（3帧, 75%）
     expect(conclusion).toContain('## 结论（按可能性排序）');
     expect(conclusion).toContain('## 掉帧聚类（先看大头）');
     expect(conclusion).toContain('## 证据链（对应上述结论）');
+    expect(conclusion).toContain('## 逐句数据引用（结构化来源）');
+    expect(conclusion).toContain('source_tool_call_id=execute_sql:1:params-a');
     expect(conclusion).toContain('滑动过程存在明显卡顿');
     expect(conclusion).toContain('对K1聚类下钻：分析 Choreographer#doFrame 耗时点');
     expect(conclusion).not.toContain('"schema_version"');
     expect(conclusion).not.toContain('"conclusion"');
+  });
+
+  test('round-trips claim references through deterministic contract markdown', () => {
+    const initial = deriveConclusionContract(JSON.stringify({
+      schema_version: 'conclusion_contract_v1',
+      mode: 'initial_report',
+      conclusion: [{ rank: 1, statement: '帧耗时异常', confidence: 90 }],
+      clusters: [],
+      evidence_chain: [{ conclusion_id: 'C1', evidence: ['帧耗时 45.6ms（ev_111111111111）'] }],
+      claims: [{
+        id: 'Q1',
+        conclusion_id: 'C1',
+        text: '帧耗时 45.6ms',
+        references: [{
+          evidence_ref_id: 'data:sql_table:current:trace-a:query-a:params-a',
+          source_ref: '表 1',
+          source_tool_call_id: 'execute_sql:1:params-a',
+          row_index: 0,
+          row_selector: { frame_id: 123 },
+          column: 'dur_ms',
+          value: 45.6,
+        }],
+      }],
+      uncertainties: [],
+      next_steps: ['owner: perf; priority: P1; action: 继续下钻; verification: 复查表 1'],
+    }));
+
+    expect(initial?.claims?.[0]?.references[0]).toMatchObject({
+      evidenceRefId: 'data:sql_table:current:trace-a:query-a:params-a',
+      sourceRef: '表 1',
+      sourceToolCallId: 'execute_sql:1:params-a',
+      rowIndex: 0,
+      rowSelector: { frame_id: 123 },
+      column: 'dur_ms',
+      value: 45.6,
+    });
+
+    const markdown = renderConclusionContractMarkdown(initial!);
+    const roundTripped = deriveConclusionContract(markdown);
+    expect(roundTripped?.claims?.[0]?.references[0]).toMatchObject({
+      evidenceRefId: 'data:sql_table:current:trace-a:query-a:params-a',
+      sourceRef: '表 1',
+      sourceToolCallId: 'execute_sql:1:params-a',
+      rowIndex: 0,
+      rowSelector: { frame_id: 123 },
+      column: 'dur_ms',
+      value: 45.6,
+    });
+
+    const selectorFromPromptFormat = deriveConclusionContract([
+      '## 逐句数据引用（结构化来源）',
+      '- Q1 / C1: 帧 123 耗时 45.6ms',
+      '  - evidence_ref_id=data:sql_table:current:trace-a:query-a:params-a; source_ref=表 1; row_selector=frame_id=123, thread=main; column=dur_ms; value=45.6',
+    ].join('\n'));
+
+    expect(selectorFromPromptFormat?.claims?.[0]?.references[0]).toMatchObject({
+      evidenceRefId: 'data:sql_table:current:trace-a:query-a:params-a',
+      sourceRef: '表 1',
+      rowSelector: { frame_id: 123, thread: 'main' },
+      column: 'dur_ms',
+      value: 45.6,
+    });
   });
 
   test('injects system-context action item with owner/priority/verification for system skills', async () => {

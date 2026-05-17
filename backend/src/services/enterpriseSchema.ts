@@ -544,6 +544,7 @@ const MIGRATIONS: MigrationStep[] = [
           trace_label TEXT NOT NULL,
           trace_metadata_json TEXT NOT NULL,
           summary_json TEXT NOT NULL,
+          conclusion_contract_json TEXT,
           status TEXT NOT NULL,
           schema_version TEXT NOT NULL,
           created_at INTEGER NOT NULL,
@@ -672,6 +673,12 @@ const MIGRATIONS: MigrationStep[] = [
         CREATE INDEX IF NOT EXISTS idx_multi_trace_comparison_inputs_snapshot
           ON multi_trace_comparison_inputs(snapshot_id, comparison_id);
       `);
+    },
+  },
+  {
+    version: 10,
+    up: (db) => {
+      addColumnIfMissing(db, 'analysis_result_snapshots', 'conclusion_contract_json', 'TEXT');
     },
   },
 ];

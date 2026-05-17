@@ -406,13 +406,13 @@ ${truncated}`;
         'Frame drops detected during list scrolling',
       ],
       sqlQueries: [
-        `SELECT name, dur, ts
+        `SELECT slice.name AS slice_name, slice.dur, slice.ts
          FROM slice
-         JOIN thread_track USING(track_id)
+         JOIN thread_track ON slice.track_id = thread_track.id
          JOIN thread USING(utid)
          WHERE thread.name = 'main'
-           AND dur > 100000000  -- > 100ms
-         ORDER BY dur DESC
+           AND slice.dur > 100000000  -- > 100ms
+         ORDER BY slice.dur DESC
          LIMIT 10;`,
         `SELECT *
          FROM heap_graph_object

@@ -19,7 +19,10 @@ import {
 import { getHTMLReportGenerator } from '../services/htmlReportGenerator';
 import { buildAgentDrivenReportData } from '../services/agentReportData';
 import { persistAgentTurn } from '../services/persistAgentSession';
-import { normalizeNarrativeForClient as sharedNormalizeNarrative } from '../services/agentResultNormalizer';
+import {
+  deriveConclusionContractForNarrative,
+  normalizeNarrativeForClient as sharedNormalizeNarrative,
+} from '../services/agentResultNormalizer';
 import { reportStore, persistReport } from './reportRoutes';
 import { SessionPersistenceService } from '../services/sessionPersistenceService';
 import { authenticate, requireRequestContext, type RequestContext } from '../middleware/auth';
@@ -43,11 +46,6 @@ import {
 } from '../agent';
 import { getSharedModelRouter } from '../agent/core/modelRouterSingleton';
 import type { IOrchestrator } from '../agent/core/orchestratorTypes';
-import {
-  deriveConclusionContract,
-  normalizeConclusionOutput,
-  shouldNormalizeConclusionOutput,
-} from '../agent/core/conclusionGenerator';
 import { resolveConclusionScene } from '../agent/core/conclusionSceneTemplates';
 import { DEEP_REASON_LABEL } from '../utils/analysisNarrative';
 import { sanitizeNarrativeForClient } from './narrativeSanitizer';
@@ -1539,7 +1537,7 @@ router.get('/:sessionId/status', (req, res) => {
       });
       const conclusionContract =
         recoveredResult.conclusionContract ||
-        deriveConclusionContract(conclusion, {
+        deriveConclusionContractForNarrative(recoveredResult.conclusion, {
           mode: recoveredResult.rounds > 1 ? 'focused_answer' : 'initial_report',
           sceneId: sceneIdHint,
         }) ||
@@ -2713,7 +2711,10 @@ async function runAgentDrivenAnalysis(
     session.lastActivityAt = Date.now();
     console.log(`[AgentRoutes.AgentDriven] Received event: ${update.type}`, update.content?.phase);
     logger.debug('Stream', `Update: ${update.type}`, update.content);
-    const normalizedUpdate = normalizeAgentDrivenUpdate(update);
+    const normalizedUpdate = augmentConclusionUpdateWithEvidenceIndex(
+      session,
+      normalizeAgentDrivenUpdate(update),
+    );
 
     // Broadcast the original event so the frontend receives raw events
     // (answer_token, thought, agent_response, conclusion, etc.) for rendering.
@@ -3056,10 +3057,11 @@ function summarizeDataEnvelopeForTimeline(update: StreamingUpdate): string {
     .filter((entry) => entry && typeof entry === 'object') as Array<Record<string, any>>;
   if (envelopes.length === 0) return '';
 
-  const titles = envelopes
+  const allTitles = envelopes
     .map((env) => sanitizeConversationText(env?.display?.title || env?.meta?.stepId || env?.meta?.source))
-    .filter(Boolean)
-    .slice(0, 2);
+    .filter(Boolean);
+  const titles = allTitles.slice(0, 4);
+  const omittedTitleCount = Math.max(0, allTitles.length - titles.length);
   const rows = envelopes
     .map((env) => {
       const data = env?.data;
@@ -3069,8 +3071,55 @@ function summarizeDataEnvelopeForTimeline(update: StreamingUpdate): string {
   const rowText = rows.length > 0
     ? `，共 ${rows.reduce((sum, rowCount) => sum + rowCount, 0)} 行`
     : '';
-  const titleText = titles.length > 0 ? `：${titles.join(' / ')}` : '';
-  return `收到 ${envelopes.length} 份数据表${titleText}${rowText}，用于支撑后续诊断`;
+  const traceSides = [...new Set(envelopes
+    .map((env) => env?.meta?.traceSide || env?.traceSide || env?.traceProvenance?.traceSide)
+    .filter((side): side is string => side === 'current' || side === 'reference'))];
+  const traceText = traceSides.length > 0
+    ? `，Trace: ${traceSides.map(side => side === 'reference' ? '参考' : '当前').join('/')}`
+    : '';
+  const evidenceRefs = envelopes
+    .map((env) => sanitizeConversationText(env?.meta?.evidenceRefId))
+    .filter(Boolean);
+  const evidenceText = evidenceRefs.length > 0
+    ? `，已登记 ${evidenceRefs.length} 个证据 ID`
+    : '';
+  const formats = [...new Set(envelopes
+    .map((env) => sanitizeConversationText(env?.display?.format, 24))
+    .filter(Boolean))];
+  const kindText = formats.length === 1
+    ? ({
+        table: '数据表',
+        summary: '摘要数据',
+        metric: '指标数据',
+        chart: '图表数据',
+        text: '文本数据',
+        timeline: '时间线数据',
+      } as Record<string, string>)[formats[0]] || '数据输出'
+    : '数据输出';
+  const planPhases = [...new Set(envelopes
+    .map((env) => sanitizeConversationText(env?.meta?.planPhaseTitle || env?.meta?.planPhaseId, 80))
+    .filter(Boolean))];
+  const phaseText = planPhases.length > 0
+    ? `，阶段: ${planPhases.slice(0, 2).join('/')}`
+    : '';
+  const phaseWarnings = [...new Set(envelopes
+    .map((env) => sanitizeConversationText(env?.meta?.planPhaseWarning, 120))
+    .filter(Boolean))];
+  const phaseWarningText = phaseWarnings.length > 0
+    ? `，阶段归因需核对: ${phaseWarnings.slice(0, 2).join('；')}`
+    : '';
+  const reasons = envelopes
+    .map((env) => sanitizeConversationText(env?.meta?.producerReason || env?.meta?.toolNarration, 180))
+    .filter(Boolean);
+  const uniqueReasons = [...new Set(reasons)].slice(0, 3);
+  const omittedReasonCount = Math.max(0, reasons.length - uniqueReasons.length);
+  const reasonText = uniqueReasons.length > 0
+    ? `：${uniqueReasons.join('；')}${omittedReasonCount > 0 ? `；另有 ${omittedReasonCount} 条原因` : ''}`
+    : '';
+  const titleText = titles.length > 0
+    ? `：${titles.join(' / ')}${omittedTitleCount > 0 ? ` / 另有 ${omittedTitleCount} 份` : ''}`
+    : '';
+  return `收到 ${envelopes.length} 份${kindText}${titleText}${rowText}${traceText}${phaseText}${phaseWarningText}${evidenceText}${reasonText || '，用于支撑后续诊断'}`;
 }
 
 function buildConversationStepUpdate(
@@ -4436,6 +4485,95 @@ function normalizeNarrativeForClient(narrative: string): string {
   return sharedNormalizeNarrative(narrative);
 }
 
+function conclusionHasEvidenceIndex(conclusion: string): boolean {
+  const text = conclusion || '';
+  return /(^|\n)\s*##\s*证据表索引\b/.test(text);
+}
+
+function markdownCell(value: unknown, maxLen = 80): string {
+  return String(value ?? '')
+    .replace(/\s+/g, ' ')
+    .replace(/\|/g, '/')
+    .trim()
+    .slice(0, maxLen) || '-';
+}
+
+function envelopeRowCount(env: DataEnvelope): string {
+  const rows = (env as any)?.data?.rows;
+  if (Array.isArray(rows)) return String(rows.length);
+
+  const summaryContent = (env as any)?.data?.summary?.content;
+  if (typeof summaryContent === 'string') {
+    const matched = summaryContent.match(/Total rows:\s*(\d+)/i);
+    if (matched) return matched[1];
+  }
+  return '-';
+}
+
+function buildConclusionEvidenceIndex(envelopes: DataEnvelope[], maxItems = 8): string {
+  if (!Array.isArray(envelopes) || envelopes.length === 0) return '';
+
+  const seen = new Set<string>();
+  const candidates: string[] = [];
+  for (const env of envelopes) {
+    const meta = (env as any)?.meta || {};
+    const display = (env as any)?.display || {};
+    if (display.level === 'hidden') continue;
+
+    const title = markdownCell(display.title || meta.stepId || meta.source);
+    if (title === '-') continue;
+
+    const key = String(meta.evidenceRefId || `${meta.source || ''}:${meta.stepId || ''}:${title}`);
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const phase = markdownCell(meta.planPhaseTitle || meta.planPhaseId || '-');
+    const source = markdownCell(meta.source || meta.skillId || 'execute_sql');
+    const evidence = markdownCell(meta.evidenceRefId || meta.sourceToolCallId || '-', 48);
+    candidates.push(`| ${phase} | ${title} | ${source} | ${envelopeRowCount(env)} | ${evidence} |`);
+  }
+
+  if (candidates.length === 0) return '';
+  const rows = candidates.slice(0, maxItems);
+  const omitted = Math.max(0, candidates.length - rows.length);
+  return [
+    '## 证据表索引',
+    '',
+    '| 阶段 | 表/摘要 | 来源 | 行数 | 证据 ID |',
+    '|---|---|---|---:|---|',
+    ...rows,
+    omitted > 0 ? `| - | 其余 ${omitted} 份证据 | - | - | - |` : '',
+  ].filter(Boolean).join('\n');
+}
+
+function appendEvidenceIndexIfMissing(conclusion: string, envelopes: DataEnvelope[]): string {
+  const normalized = conclusion || '';
+  if (conclusionHasEvidenceIndex(normalized)) return normalized;
+  const evidenceIndex = buildConclusionEvidenceIndex(envelopes);
+  if (!evidenceIndex) return normalized;
+  return `${normalized.trim()}\n\n${evidenceIndex}`;
+}
+
+function augmentConclusionUpdateWithEvidenceIndex(
+  session: AnalysisSession,
+  update: StreamingUpdate,
+): StreamingUpdate {
+  if (update.type !== 'conclusion') return update;
+  const content = update.content;
+  if (!content || typeof content !== 'object' || Array.isArray(content)) return update;
+  const conclusion = (content as Record<string, any>).conclusion;
+  if (typeof conclusion !== 'string') return update;
+  const augmented = appendEvidenceIndexIfMissing(conclusion, session.dataEnvelopes || []);
+  if (augmented === conclusion) return update;
+  return {
+    ...update,
+    content: {
+      ...(content as Record<string, any>),
+      conclusion: augmented,
+    },
+  };
+}
+
 /**
  * Send agent-driven analysis result to SSE client
  */
@@ -4444,9 +4582,13 @@ function sendAgentDrivenResult(res: express.Response, session: AnalysisSession) 
   if (!result) return;
   const observability = buildStreamObservability(session);
   const replayOnlyScene = isSceneReplayOnlyQuery(session.query);
+  const hasEvidenceBackedConclusion = result.success || result.partial === true;
   const normalizedConclusion = replayOnlyScene
     ? buildSceneReplayNarrative(session.scenes || [])
-    : normalizeNarrativeForClient(result.conclusion);
+    : hasEvidenceBackedConclusion ? appendEvidenceIndexIfMissing(
+      normalizeNarrativeForClient(result.conclusion),
+      session.dataEnvelopes || [],
+    ) : normalizeNarrativeForClient(result.conclusion);
   const sceneIdHint = replayOnlyScene
     ? undefined
     : resolveConclusionSceneIdHint({
@@ -4459,14 +4601,14 @@ function sendAgentDrivenResult(res: express.Response, session: AnalysisSession) 
   // (which only the orchestrator knows). Both signal "multi-interaction" analysis.
   const normalizedConclusionContract = replayOnlyScene
     ? undefined
-    : (
+    : hasEvidenceBackedConclusion ? (
       result.conclusionContract ||
-      deriveConclusionContract(normalizedConclusion, {
+      deriveConclusionContractForNarrative(result.conclusion, {
         mode: result.rounds > 1 ? 'focused_answer' : 'initial_report',
         sceneId: sceneIdHint,
       }) ||
       undefined
-    );
+    ) : undefined;
   const resultForClient =
     normalizedConclusion === result.conclusion && normalizedConclusionContract === result.conclusionContract
       ? result
@@ -4481,149 +4623,156 @@ function sendAgentDrivenResult(res: express.Response, session: AnalysisSession) 
   let resultSnapshotId: string | undefined;
   let resultSnapshotEventData: Record<string, unknown> | undefined;
   let reportLease: TraceProcessorLeaseRecord | null = null;
-  try {
-    if (enterpriseLeasesEnabled()) {
-      const scope = leaseScopeFromSession(session);
-      if (scope) {
-        const traceInfo = getTraceProcessorService().getTrace(session.traceId);
-        const reportLeaseDecision = buildLeaseModeDecisionForTrace(
-          scope,
-          session.traceId,
-          'report_generation',
-          {
-            traceSizeBytes: traceInfo?.size,
-          },
-        );
-        reportLease = getTraceProcessorLeaseStore().acquireHolder(
-          scope,
-          session.traceId,
-          {
-            holderType: 'report_generation',
-            holderRef: reportId,
-            reportId,
-            sessionId: session.sessionId,
-            runId: session.lastRun?.runId || session.activeRun?.runId,
-            metadata: {
-              leaseModeReason: reportLeaseDecision.reason,
-              leaseModeSignals: reportLeaseDecision.signals,
-            },
-          },
-          { mode: reportLeaseDecision.mode },
-        );
-        reportLease = markLeaseReadyIfNew(reportLease, scope);
-      }
-    }
-
-    const generator = getHTMLReportGenerator();
-    // Report assembly (cumulative findings dedup, empty-conclusion fallback,
-    // snapshot-first analysisNotes/Plan/Flags) lives in the shared builder so
-    // the CLI path produces identical output.
-    const reportData = buildAgentDrivenReportData({
-      session,
-      result: resultForClient as any,
-    });
-    console.log(`[AgentRoutes] Generating HTML report, data keys:`, {
-      hasResult: !!result,
-      conclusionLength: normalizedConclusion?.length || 0,
-      conclusionPreview: (normalizedConclusion || '').substring(0, 100),
-      hasConclusionContract: !!normalizedConclusionContract,
-      findingsCount: result.findings?.length || 0,
-      hypothesesCount: session.hypotheses?.length || 0,
-      dialogueCount: session.agentDialogue?.length || 0,
-      conversationStepCount: session.conversationSteps?.length || 0,
-      dataEnvelopesCount: session.dataEnvelopes?.length || 0,
-      agentResponsesCount: session.agentResponses?.length || 0,
-      conclusionHistoryCount: session.conclusionHistory?.length || 0,
-      hasSnapshot: !!(session as any)._lastSnapshot,
-      snapshotNotes: (session as any)._lastSnapshot?.analysisNotes?.length ?? 'n/a',
-      snapshotPlan: !!(session as any)._lastSnapshot?.analysisPlan,
-      snapshotFlags: (session as any)._lastSnapshot?.uncertaintyFlags?.length ?? 'n/a',
-    });
-
-    const html = generator.generateAgentDrivenHTML(reportData);
-
-    // Store report
-    persistReport(reportId, {
-      html,
-      generatedAt: Date.now(),
-      sessionId: session.sessionId,
-      runId: session.lastRun?.runId || session.activeRun?.runId,
-      traceId: session.traceId,
-      tenantId: session.tenantId,
-      workspaceId: session.workspaceId,
-      userId: session.userId,
-      visibility: 'private',
-    });
-
-    reportUrl = `/api/reports/${reportId}`;
-    console.log(`[AgentRoutes] Generated agent-driven HTML report: ${reportId} (${html.length} bytes)`);
-  } catch (error: any) {
-    reportError = error.message || 'Unknown error';
-    console.error('[AgentRoutes] Failed to generate agent-driven HTML report:', {
-      error: reportError,
-      stack: error.stack?.split('\n').slice(0, 5).join('\n'),
-      resultConclusion: result?.conclusion ? `${result.conclusion.length} chars` : 'EMPTY/NULL',
-      resultConfidence: result?.confidence,
-      resultRounds: result?.rounds,
-    });
-  } finally {
-    if (reportLease) {
-      const scope = leaseScopeFromSession(session);
-      if (scope) {
-        try {
-          getTraceProcessorLeaseStore().releaseHolder(
+  if (!hasEvidenceBackedConclusion) {
+    reportError = `analysis did not complete successfully (${result.terminationReason || 'failed'})`;
+  } else {
+    try {
+      if (enterpriseLeasesEnabled()) {
+        const scope = leaseScopeFromSession(session);
+        if (scope) {
+          const traceInfo = getTraceProcessorService().getTrace(session.traceId);
+          const reportLeaseDecision = buildLeaseModeDecisionForTrace(
             scope,
-            reportLease.id,
+            session.traceId,
             'report_generation',
-            reportId,
+            {
+              traceSizeBytes: traceInfo?.size,
+            },
           );
-        } catch (releaseError: any) {
-          console.warn(`[AgentRoutes] Failed to release report_generation lease ${reportLease.id}: ${releaseError.message}`);
+          reportLease = getTraceProcessorLeaseStore().acquireHolder(
+            scope,
+            session.traceId,
+            {
+              holderType: 'report_generation',
+              holderRef: reportId,
+              reportId,
+              sessionId: session.sessionId,
+              runId: session.lastRun?.runId || session.activeRun?.runId,
+              metadata: {
+                leaseModeReason: reportLeaseDecision.reason,
+                leaseModeSignals: reportLeaseDecision.signals,
+              },
+            },
+            { mode: reportLeaseDecision.mode },
+          );
+          reportLease = markLeaseReadyIfNew(reportLease, scope);
+        }
+      }
+
+      const generator = getHTMLReportGenerator();
+      // Report assembly (cumulative findings dedup, empty-conclusion fallback,
+      // snapshot-first analysisNotes/Plan/Flags) lives in the shared builder so
+      // the CLI path produces identical output.
+      const reportData = buildAgentDrivenReportData({
+        session,
+        result: resultForClient as any,
+      });
+      console.log(`[AgentRoutes] Generating HTML report, data keys:`, {
+        hasResult: !!result,
+        conclusionLength: normalizedConclusion?.length || 0,
+        conclusionPreview: (normalizedConclusion || '').substring(0, 100),
+        hasConclusionContract: !!normalizedConclusionContract,
+        findingsCount: result.findings?.length || 0,
+        hypothesesCount: session.hypotheses?.length || 0,
+        dialogueCount: session.agentDialogue?.length || 0,
+        conversationStepCount: session.conversationSteps?.length || 0,
+        dataEnvelopesCount: session.dataEnvelopes?.length || 0,
+        agentResponsesCount: session.agentResponses?.length || 0,
+        conclusionHistoryCount: session.conclusionHistory?.length || 0,
+        hasSnapshot: !!(session as any)._lastSnapshot,
+        snapshotNotes: (session as any)._lastSnapshot?.analysisNotes?.length ?? 'n/a',
+        snapshotPlan: !!(session as any)._lastSnapshot?.analysisPlan,
+        snapshotFlags: (session as any)._lastSnapshot?.uncertaintyFlags?.length ?? 'n/a',
+      });
+
+      const html = generator.generateAgentDrivenHTML(reportData);
+
+      // Store report
+      persistReport(reportId, {
+        html,
+        generatedAt: Date.now(),
+        sessionId: session.sessionId,
+        runId: session.lastRun?.runId || session.activeRun?.runId,
+        traceId: session.traceId,
+        tenantId: session.tenantId,
+        workspaceId: session.workspaceId,
+        userId: session.userId,
+        visibility: 'private',
+      });
+
+      reportUrl = `/api/reports/${reportId}`;
+      console.log(`[AgentRoutes] Generated agent-driven HTML report: ${reportId} (${html.length} bytes)`);
+    } catch (error: any) {
+      reportError = error.message || 'Unknown error';
+      console.error('[AgentRoutes] Failed to generate agent-driven HTML report:', {
+        error: reportError,
+        stack: error.stack?.split('\n').slice(0, 5).join('\n'),
+        resultConclusion: result?.conclusion ? `${result.conclusion.length} chars` : 'EMPTY/NULL',
+        resultConfidence: result?.confidence,
+        resultRounds: result?.rounds,
+      });
+    } finally {
+      if (reportLease) {
+        const scope = leaseScopeFromSession(session);
+        if (scope) {
+          try {
+            getTraceProcessorLeaseStore().releaseHolder(
+              scope,
+              reportLease.id,
+              'report_generation',
+              reportId,
+            );
+          } catch (releaseError: any) {
+            console.warn(`[AgentRoutes] Failed to release report_generation lease ${reportLease.id}: ${releaseError.message}`);
+          }
         }
       }
     }
   }
 
-  try {
-    const resultSnapshot = persistCompletedAnalysisResultSnapshot({
-      tenantId: session.tenantId,
-      workspaceId: session.workspaceId,
-      userId: session.userId,
-      traceId: session.traceId,
-      sessionId: session.sessionId,
-      runId: session.lastRun?.runId || session.activeRun?.runId,
-      reportId: reportUrl ? reportId : undefined,
-      query: session.query,
-      traceLabel: session.traceId,
-      conclusion: normalizedConclusion,
-      confidence: result.confidence,
-      partial: result.partial,
-      terminationReason: result.terminationReason,
-      terminationMessage: result.terminationMessage,
-      dataEnvelopes: session.dataEnvelopes,
-    });
-    resultSnapshotId = resultSnapshot?.id;
-    if (resultSnapshot) {
-      resultSnapshotEventData = {
-        snapshotId: resultSnapshot.id,
-        status: resultSnapshot.status,
-        sceneType: resultSnapshot.sceneType,
-        metricCount: resultSnapshot.metrics.length,
-        evidenceRefCount: resultSnapshot.evidenceRefs.length,
-        traceId: resultSnapshot.traceId,
-        sessionId: resultSnapshot.sessionId,
-        runId: resultSnapshot.runId,
-        reportId: resultSnapshot.reportId,
-        visibility: resultSnapshot.visibility,
-        createdAt: resultSnapshot.createdAt,
-      };
+  if (hasEvidenceBackedConclusion) {
+    try {
+      const resultSnapshot = persistCompletedAnalysisResultSnapshot({
+        tenantId: session.tenantId,
+        workspaceId: session.workspaceId,
+        userId: session.userId,
+        traceId: session.traceId,
+        sessionId: session.sessionId,
+        runId: session.lastRun?.runId || session.activeRun?.runId,
+        reportId: reportUrl ? reportId : undefined,
+        query: session.query,
+        traceLabel: session.traceId,
+        conclusion: normalizedConclusion,
+        conclusionContract: normalizedConclusionContract,
+        confidence: result.confidence,
+        partial: result.partial,
+        terminationReason: result.terminationReason,
+        terminationMessage: result.terminationMessage,
+        dataEnvelopes: session.dataEnvelopes,
+      });
+      resultSnapshotId = resultSnapshot?.id;
+      if (resultSnapshot) {
+        resultSnapshotEventData = {
+          snapshotId: resultSnapshot.id,
+          status: resultSnapshot.status,
+          sceneType: resultSnapshot.sceneType,
+          metricCount: resultSnapshot.metrics.length,
+          evidenceRefCount: resultSnapshot.evidenceRefs.length,
+          traceId: resultSnapshot.traceId,
+          sessionId: resultSnapshot.sessionId,
+          runId: resultSnapshot.runId,
+          reportId: resultSnapshot.reportId,
+          visibility: resultSnapshot.visibility,
+          createdAt: resultSnapshot.createdAt,
+        };
+      }
+    } catch (snapshotError: any) {
+      console.warn('[AgentRoutes] Failed to persist analysis result snapshot:', {
+        sessionId: session.sessionId,
+        runId: session.lastRun?.runId || session.activeRun?.runId,
+        error: snapshotError?.message || String(snapshotError),
+      });
     }
-  } catch (snapshotError: any) {
-    console.warn('[AgentRoutes] Failed to persist analysis result snapshot:', {
-      sessionId: session.sessionId,
-      runId: session.lastRun?.runId || session.activeRun?.runId,
-      error: snapshotError?.message || String(snapshotError),
-    });
   }
 
   if (resultSnapshotEventData) {

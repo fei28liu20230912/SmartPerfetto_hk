@@ -703,6 +703,9 @@ if [ -n "$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=normal)" 
   GIT_DIRTY=true
 fi
 
+echo "Checking frontend prebuild..."
+node "$PROJECT_ROOT/scripts/check-frontend-prebuild.cjs"
+
 if [ "$SKIP_BACKEND_BUILD" = false ]; then
   echo "Building backend runtime..."
   (cd "$PROJECT_ROOT/backend" && npm run build)

@@ -20,7 +20,7 @@ import * as path from 'path';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 import { createSdkEnv, getSdkBinaryOption } from './claudeConfig';
 import type { Finding, StreamingUpdate } from '../agent/types';
-import type { VerificationResult, VerificationIssue, AnalysisPlanV3, Hypothesis } from './types';
+import type { VerificationResult, VerificationIssue, AnalysisPlanV3, Hypothesis, ToolCallRecord } from './types';
 import { expectedToolNames } from './types';
 import type { SceneType } from './sceneClassifier';
 import { DEFAULT_OUTPUT_LANGUAGE, localize, type OutputLanguage } from './outputLanguage';
@@ -317,6 +317,7 @@ export function verifyHeuristic(
       const hasProperEnding = /[。.!！?？）\]】`✅✓☑→]$/.test(lastLine) ||
                               /^```$/.test(lastLine) ||
                               /^\|.*\|$/.test(lastLine) ||
+                              /^\s*-\s*evidence_ref_id=.*\bvalue=.+$/i.test(lastLine) ||
                               /^---+$/.test(lastLine);
       if (!hasProperEnding) {
         // Severity: error — triggers correction retry so the agent can complete the conclusion.
@@ -434,6 +435,7 @@ export function verifySceneCompleteness(
   sceneType: SceneType,
   findings: Finding[],
   conclusion: string,
+  toolCalls: ToolCallRecord[] = [],
 ): VerificationIssue[] {
   const issues: VerificationIssue[] = [];
   const allText = (
@@ -455,8 +457,11 @@ export function verifySceneCompleteness(
       // Require at least one REAL analysis tool (not just lookup_knowledge which only reads background docs)
       // blocking_chain_analysis/binder_root_cause/jank_frame_detail/surfaceflinger_analysis/frame_production_gap = real deep-drill skills
       // lookup_knowledge is supplementary — counts as evidence only when combined with analysis output patterns
-      const hasAnalysisTool = /blocking_chain_analysis|binder_root_cause|jank_frame_detail|surfaceflinger_analysis|frame_production_gap|阻塞链.*(?:唤醒|waker|blocker)|server_dur/i.test(allText);
-      const hasKnowledgeDrill = /lookup_knowledge|cpu[\.\-]scheduler|rendering[\.\-]pipeline|thermal[\.\-]throttling/i.test(allText);
+      const calledSkills = toolCalls.map(call => `${call.toolName} ${call.skillId ?? ''} ${call.inputSummary ?? ''}`).join(' ').toLowerCase();
+      const hasAnalysisTool = /blocking_chain_analysis|binder_root_cause|jank_frame_detail|frame_blocking_calls|surfaceflinger_analysis|frame_production_gap|阻塞链.*(?:唤醒|waker|blocker)|server_dur/i.test(allText) ||
+        /jank_frame_detail|frame_blocking_calls|blocking_chain_analysis|binder_root_cause|surfaceflinger_analysis|frame_production_gap/i.test(calledSkills);
+      const hasKnowledgeDrill = /lookup_knowledge|cpu[\.\-]scheduler|rendering[\.\-]pipeline|thermal[\.\-]throttling/i.test(allText) ||
+        /lookup_knowledge.*(cpu|scheduler|rendering|pipeline|thermal|throttling)/i.test(calledSkills);
       const hasDeepDrill = hasAnalysisTool || hasKnowledgeDrill;
       // Check if there are significant jank frames (the analysis mentions percentage distributions)
       const hasSignificantJank = /(?:[2-9]\d|[1-9]\d{2,})\s*帧|(?:[1-9]\d+)\s*%.*(?:freq_ramp|workload|sched_delay|lock_binder|binder_wait|thermal|sf_composition|render_thread|gc_pressure|cpu_max)/i.test(allText);
@@ -962,6 +967,7 @@ ${issueList ? `待解决问题：\n${issueList}\n` : ''}${warningList}
    - 代表帧分析（每个根因类别的最严重帧，含四象限+频率+根因推理链）
    - 优化建议（按优先级排序）
 3. **使用已收集的数据**，不需要重新调用 invoke_skill 获取概览数据
+4. 报告必须完整但压缩，目标不超过约 6000 中文字符；不要逐行复制已展示的大表，只引用关键行和 evidence/source
 
 ### 已有推理上下文
 ${originalConclusion.substring(0, 2000)}
@@ -1005,6 +1011,7 @@ ${issueList}${warningList}
    - **missing_reasoning**: 补充完整的分析结论
    - **unresolved_hypothesis**: 调用 resolve_hypothesis 将所有未解决假设标记为 confirmed 或 rejected
 3. 输出修正后的完整结论
+4. 结论必须完整但压缩，目标不超过约 6000 中文字符；不要逐行复制已展示的大表，只引用关键行和 evidence/source
 
 ### 原始结论（需修正）
 ${originalConclusion.substring(0, 2000)}
@@ -1053,7 +1060,7 @@ export async function verifyConclusion(
 
   // Layer 2.7: Scene completeness check (P1-G15)
   if (sceneType && sceneType !== 'general') {
-    const sceneIssues = verifySceneCompleteness(sceneType, findings, conclusion);
+    const sceneIssues = verifySceneCompleteness(sceneType, findings, conclusion, plan?.toolCallLog ?? []);
     heuristicIssues.push(...sceneIssues);
   }
 

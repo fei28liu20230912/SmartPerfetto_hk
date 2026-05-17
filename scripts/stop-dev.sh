@@ -47,7 +47,7 @@ echo "Cleaning up zombie watch processes..."
 pkill -f "$PROJECT_ROOT/backend/node_modules/.bin/tsx watch src/index.ts" 2>/dev/null || true
 pkill -f "tsc.*perfetto.*watch" 2>/dev/null || true
 pkill -f "rollup.*perfetto.*watch" 2>/dev/null || true
-pkill -f "node.*perfetto/ui/build.js" 2>/dev/null || true
+pkill -f "node.*perfetto/ui/build.mjs" 2>/dev/null || true
 
 # Kill orphan trace_processor_shell processes
 echo "Cleaning up trace_processor_shell processes..."

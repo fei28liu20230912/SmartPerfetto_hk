@@ -111,6 +111,56 @@ router.get('/', (req, res) => {
   }
 });
 
+router.get('/:snapshotId', (req, res) => {
+  const context = requireRequestContext(req);
+  if (!hasRbacPermission(context, 'analysis_result:read')) {
+    sendForbidden(res, 'analysis_result:read permission is required');
+    return;
+  }
+
+  const snapshotId = optionalString(req.params.snapshotId);
+  if (!snapshotId) {
+    res.status(400).json({
+      success: false,
+      error: 'snapshotId is required',
+    });
+    return;
+  }
+
+  const db = openEnterpriseDb();
+  try {
+    const repository = createAnalysisResultSnapshotRepository(db);
+    const snapshot = repository.getSnapshot(
+      {
+        tenantId: context.tenantId,
+        workspaceId: context.workspaceId,
+        userId: context.userId,
+      },
+      snapshotId,
+    );
+    if (!snapshot) {
+      res.status(404).json({
+        success: false,
+        error: 'Analysis result snapshot not found',
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      snapshot,
+    });
+  } catch (error) {
+    console.error('[AnalysisResultRoutes] Failed to read analysis result:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to read analysis result',
+    });
+  } finally {
+    db.close();
+  }
+});
+
 router.patch('/:snapshotId', (req, res) => {
   const context = requireRequestContext(req);
   const snapshotId = optionalString(req.params.snapshotId);
