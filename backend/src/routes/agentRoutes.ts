@@ -4817,6 +4817,7 @@ function sendAgentDrivenResult(res: express.Response, session: AnalysisSession) 
       reportError,
       resultSnapshotId,
       observability,
+      tokenUsage: result.tokenUsage,
     },
     timestamp: Date.now(),
   });

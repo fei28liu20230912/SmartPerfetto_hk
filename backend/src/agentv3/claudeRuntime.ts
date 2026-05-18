@@ -1779,6 +1779,20 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       // Convert agentv3 Hypothesis to agentProtocol Hypothesis format for AnalysisResult
       const turnHypotheses = (this.sessionHypotheses.get(sessionId) || []).map(h => this.toProtocolHypothesis(h));
 
+      // Aggregate token usage from turn metrics
+      const totalInput = turnMetricsList.reduce((s, t) => s + (t.inputTokens ?? 0), 0);
+      const totalOutput = turnMetricsList.reduce((s, t) => s + (t.outputTokens ?? 0), 0);
+      const totalCacheRead = turnMetricsList.reduce((s, t) => s + (t.cacheReadTokens ?? 0), 0);
+      const totalCacheCreation = turnMetricsList.reduce((s, t) => s + (t.cacheCreationTokens ?? 0), 0);
+      const sessionMetrics = metricsCollector.summarize();
+      const tokenUsage = (totalInput + totalOutput) > 0 ? {
+        inputTokens: totalInput,
+        outputTokens: totalOutput,
+        cacheReadTokens: totalCacheRead,
+        cacheCreationTokens: totalCacheCreation,
+        totalCostUsd: sessionMetrics.cache?.totalCostUsd,
+      } : undefined;
+
       return {
         sessionId,
         success: true,
@@ -1791,6 +1805,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         partial: isPartialResult || undefined,
         terminationReason,
         terminationMessage,
+        tokenUsage,
       };
 	    } catch (error) {
 	      const rawErrorMessage = (error as Error).message || 'Unknown error';

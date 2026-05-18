@@ -223,6 +223,13 @@ export interface AnalysisResult {
   partial?: boolean;
   terminationReason?: AnalysisTerminationReason;
   terminationMessage?: string;
+  tokenUsage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    totalCostUsd?: number;
+  };
 }
 
 export type AgentRuntimeAnalysisResult = AnalysisResult;
