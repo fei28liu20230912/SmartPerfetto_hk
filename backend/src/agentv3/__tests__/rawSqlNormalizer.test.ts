@@ -170,6 +170,133 @@ describe('normalizeRawSql', () => {
     expect(result.rewrites).toContain('inserted missing whitespace between boolean operators and known Perfetto columns');
   });
 
+  it('rewrites thread main_thread filters to the real is_main_thread column', () => {
+    const input = `
+      SELECT s.name AS slice_name, s.dur / 1e6 AS dur_ms, s.ts, ts2.state
+      FROM thread_slice s
+      JOIN thread_state ts2 ON ts2.utid = (
+        SELECT utid FROM thread WHERE name = 'unch.aosp.heavy' AND main_thread = 1
+      )
+      WHERE s.process_name GLOB 'com.example.launch.aosp.heavy*'
+        AND s.is_main_thread = 1
+        AND s.name = 'LoadSimulator_ActivityInit'
+        AND ts2.ts >= s.ts
+        AND ts2.ts < s.ts + s.dur
+        AND ts2.state = 'S'
+      ORDER BY ts2.dur DESC
+      LIMIT 10
+    `;
+
+    const result = normalizeRawSql(input);
+
+    expect(result.sql).toContain("SELECT utid FROM thread WHERE name = 'unch.aosp.heavy' AND is_main_thread = 1");
+    expect(result.sql).not.toMatch(/\bmain_thread\s*=/i);
+    expect(result.rewrites).toContain(
+      'rewrote thread main_thread column to is_main_thread; Perfetto thread table uses is_main_thread',
+    );
+  });
+
+  it('rewrites qualified thread aliases from main_thread to is_main_thread', () => {
+    const input = `
+      SELECT t.utid
+      FROM thread t
+      WHERE t.main_thread = 1
+    `;
+
+    const result = normalizeRawSql(input);
+
+    expect(result.sql).toContain('WHERE t.is_main_thread = 1');
+    expect(result.sql).not.toMatch(/\bt\.main_thread\b/i);
+    expect(result.rewrites).toContain(
+      'rewrote thread main_thread column to is_main_thread; Perfetto thread table uses is_main_thread',
+    );
+  });
+
+  it('rewrites thread main_thread references in comma-joined table lists', () => {
+    const input = `
+      SELECT t.utid
+      FROM slice s, thread t
+      WHERE t.main_thread = 1
+        AND s.utid = t.utid
+    `;
+
+    const result = normalizeRawSql(input);
+
+    expect(result.sql).toContain('WHERE t.is_main_thread = 1');
+    expect(result.sql).not.toMatch(/\bt\.main_thread\b/i);
+    expect(result.rewrites).toContain(
+      'rewrote thread main_thread column to is_main_thread; Perfetto thread table uses is_main_thread',
+    );
+  });
+
+  it('rewrites bare selected and ordered main_thread columns on the thread table', () => {
+    const input = `
+      SELECT main_thread
+      FROM thread
+      ORDER BY main_thread DESC
+    `;
+
+    const result = normalizeRawSql(input);
+
+    expect(result.sql).toContain('SELECT is_main_thread');
+    expect(result.sql).toContain('ORDER BY is_main_thread DESC');
+    expect(result.sql).not.toMatch(/(?<!is_)\bmain_thread\b/i);
+    expect(result.rewrites).toContain(
+      'rewrote thread main_thread column to is_main_thread; Perfetto thread table uses is_main_thread',
+    );
+  });
+
+  it('does not rewrite a compatibility alias named main_thread', () => {
+    const input = `
+      SELECT is_main_thread AS main_thread
+      FROM thread
+    `;
+
+    const result = normalizeRawSql(input);
+
+    expect(result).toEqual({ sql: input, rewrites: [] });
+  });
+
+  it('rewrites main_thread filters when the thread table is quoted', () => {
+    const input = `
+      SELECT t.utid
+      FROM "thread" AS t
+      WHERE t.main_thread = 1
+    `;
+
+    const result = normalizeRawSql(input);
+
+    expect(result.sql).toContain('WHERE t.is_main_thread = 1');
+    expect(result.sql).not.toMatch(/\bt\.main_thread\b/i);
+    expect(result.rewrites).toContain(
+      'rewrote thread main_thread column to is_main_thread; Perfetto thread table uses is_main_thread',
+    );
+  });
+
+  it('does not rewrite main_thread-looking text inside SQL literals or comments', () => {
+    const input = `
+      SELECT 'main_thread = 1' AS note
+      FROM thread
+      WHERE name = 'main_thread = 1'
+        -- main_thread = 1 is documentation text, not SQL
+    `;
+
+    expect(normalizeRawSql(input)).toEqual({ sql: input, rewrites: [] });
+  });
+
+  it('does not rewrite when a CTE named thread shadows the Perfetto thread table', () => {
+    const input = `
+      WITH thread AS (
+        SELECT 1 AS main_thread
+      )
+      SELECT *
+      FROM thread
+      WHERE main_thread = 1
+    `;
+
+    expect(normalizeRawSql(input)).toEqual({ sql: input, rewrites: [] });
+  });
+
   it('inserts thread join when SQL joins process through thread_track.upid', () => {
     const input = `
       SELECT
@@ -248,6 +375,24 @@ describe('normalizeRawSql', () => {
     expect(result.sql).toContain('FROM actual_frame_timeline_slice a');
     expect(result.sql).toContain('CAST(NULL AS TEXT) AS reason_code');
     expect(result.sql).toContain('source_note');
+    expect(result.sql).not.toContain('__intrinsic_batch_frame_root_cause');
+    expect(result.rewrites).toContain(
+      'replaced unsupported __intrinsic_batch_frame_root_cause lookup with a safe FrameTimeline lookup; batch_frame_root_cause is a skill artifact and derived fields require fetch_artifact',
+    );
+  });
+
+  it('rewrites quoted intrinsic batch root-cause table lookups to safe FrameTimeline lookups', () => {
+    const input = `
+      SELECT reason_code
+      FROM "__intrinsic_batch_frame_root_cause"
+      WHERE frame_id IN ('59665234', '59666150')
+    `;
+
+    const result = normalizeRawSql(input);
+
+    expect(result.sql).toContain('WITH frame_lookup AS');
+    expect(result.sql).toContain("SELECT '59665234' AS frame_id");
+    expect(result.sql).toContain("UNION ALL SELECT '59666150' AS frame_id");
     expect(result.sql).not.toContain('__intrinsic_batch_frame_root_cause');
     expect(result.rewrites).toContain(
       'replaced unsupported __intrinsic_batch_frame_root_cause lookup with a safe FrameTimeline lookup; batch_frame_root_cause is a skill artifact and derived fields require fetch_artifact',

@@ -11,6 +11,196 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function maskSqlLiteralsCommentsAndQuotedIdentifiers(sql: string): string {
+  const chars = sql.split('');
+  const maskRange = (start: number, end: number) => {
+    for (let i = start; i < end; i += 1) {
+      if (chars[i] !== '\n' && chars[i] !== '\r') chars[i] = ' ';
+    }
+  };
+
+  let i = 0;
+  while (i < sql.length) {
+    const char = sql[i];
+    const next = sql[i + 1];
+
+    if (char === '-' && next === '-') {
+      const start = i;
+      i += 2;
+      while (i < sql.length && sql[i] !== '\n' && sql[i] !== '\r') i += 1;
+      maskRange(start, i);
+      continue;
+    }
+
+    if (char === '/' && next === '*') {
+      const start = i;
+      i += 2;
+      while (i < sql.length && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1;
+      i = Math.min(sql.length, i + 2);
+      maskRange(start, i);
+      continue;
+    }
+
+    if (char === '\'' || char === '"' || char === '`') {
+      const quote = char;
+      const start = i;
+      i += 1;
+      while (i < sql.length) {
+        if (sql[i] === quote) {
+          if (sql[i + 1] === quote) {
+            i += 2;
+            continue;
+          }
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      maskRange(start, i);
+      continue;
+    }
+
+    if (char === '[') {
+      const start = i;
+      i += 1;
+      while (i < sql.length && sql[i] !== ']') i += 1;
+      i = Math.min(sql.length, i + 1);
+      maskRange(start, i);
+      continue;
+    }
+
+    i += 1;
+  }
+
+  return chars.join('');
+}
+
+function replaceOutsideSqlLiteralsCommentsAndQuotedIdentifiers(
+  sql: string,
+  pattern: RegExp,
+  replacement: (match: string, ...args: string[]) => string,
+): { sql: string; count: number } {
+  const masked = maskSqlLiteralsCommentsAndQuotedIdentifiers(sql);
+  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
+  const matcher = new RegExp(pattern.source, flags);
+  let match: RegExpExecArray | null;
+  let rewritten = '';
+  let lastIndex = 0;
+  let count = 0;
+
+  while ((match = matcher.exec(masked)) !== null) {
+    count += 1;
+    rewritten += sql.slice(lastIndex, match.index);
+    rewritten += replacement(sql.slice(match.index, matcher.lastIndex), ...match.slice(1));
+    lastIndex = matcher.lastIndex;
+    if (match[0].length === 0) matcher.lastIndex += 1;
+  }
+
+  if (count === 0) return { sql, count: 0 };
+  rewritten += sql.slice(lastIndex);
+  return { sql: rewritten, count };
+}
+
+function skipSqlIgnoredText(sql: string, index: number): number {
+  const char = sql[index];
+  const next = sql[index + 1];
+  if (char === '-' && next === '-') {
+    let i = index + 2;
+    while (i < sql.length && sql[i] !== '\n' && sql[i] !== '\r') i += 1;
+    return i;
+  }
+  if (char === '/' && next === '*') {
+    let i = index + 2;
+    while (i < sql.length && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1;
+    return Math.min(sql.length, i + 2);
+  }
+  if (char === '\'' || char === '"' || char === '`') {
+    let i = index + 1;
+    while (i < sql.length) {
+      if (sql[i] === char) {
+        if (sql[i + 1] === char) {
+          i += 2;
+          continue;
+        }
+        return i + 1;
+      }
+      i += 1;
+    }
+    return sql.length;
+  }
+  if (char === '[') {
+    let i = index + 1;
+    while (i < sql.length && sql[i] !== ']') i += 1;
+    return Math.min(sql.length, i + 1);
+  }
+  return index;
+}
+
+function readSqlIdentifierToken(sql: string, index: number): { value: string; end: number } | null {
+  const char = sql[index];
+  if (char === '\'' || char === '"' || char === '`') {
+    const end = skipSqlIgnoredText(sql, index);
+    const inner = sql.slice(index + 1, end - 1).split(`${char}${char}`).join(char);
+    return { value: inner, end };
+  }
+  if (char === '[') {
+    const end = skipSqlIgnoredText(sql, index);
+    return { value: sql.slice(index + 1, end - 1), end };
+  }
+
+  let i = index;
+  while (i < sql.length && /[A-Za-z0-9_$-]/.test(sql[i])) i += 1;
+  if (i === index) return null;
+  return { value: sql.slice(index, i), end: i };
+}
+
+function readSqlTableNameAfterFromOrJoin(sql: string, index: number): { tableName: string; end: number } | null {
+  let i = index;
+  while (i < sql.length && /\s/.test(sql[i])) i += 1;
+  if (sql[i] === '(') return null;
+
+  let token = readSqlIdentifierToken(sql, i);
+  if (!token) return null;
+  let tableName = token.value;
+  i = token.end;
+
+  while (i < sql.length && /\s/.test(sql[i])) i += 1;
+  if (sql[i] === '.') {
+    i += 1;
+    while (i < sql.length && /\s/.test(sql[i])) i += 1;
+    token = readSqlIdentifierToken(sql, i);
+    if (token) {
+      tableName = token.value;
+      i = token.end;
+    }
+  }
+
+  return { tableName, end: i };
+}
+
+const TABLE_ALIAS_BOUNDARY_WORD = /^(WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|CROSS|FULL|NATURAL|GROUP|ORDER|LIMIT|ON|USING|HAVING|UNION|EXCEPT|INTERSECT|WINDOW|QUALIFY|VALUES)$/i;
+
+function readOptionalSqlAliasToken(sql: string, index: number): { value: string; end: number } | null {
+  let i = index;
+  while (i < sql.length && /\s/.test(sql[i])) i += 1;
+  const asMatch = /^AS\b/i.exec(sql.slice(i));
+  if (asMatch) {
+    i += asMatch[0].length;
+    while (i < sql.length && /\s/.test(sql[i])) i += 1;
+  }
+
+  const token = readSqlIdentifierToken(sql, i);
+  if (!token) return null;
+  if (TABLE_ALIAS_BOUNDARY_WORD.test(token.value)) {
+    return null;
+  }
+  return token;
+}
+
+function readOptionalSqlAlias(sql: string, index: number): string | null {
+  return readOptionalSqlAliasToken(sql, index)?.value ?? null;
+}
+
 const THREAD_SLICE_FROM = /\bFROM\s+thread_slice(?:\s+(?:AS\s+)?(?!WHERE\b|JOIN\b|LEFT\b|RIGHT\b|INNER\b|OUTER\b|CROSS\b|GROUP\b|ORDER\b|LIMIT\b|ON\b|USING\b)([A-Za-z_]\w*))?/i;
 const SLICE_FROM_WITH_ALIAS = /\bFROM\s+slice\s+(?:AS\s+)?([A-Za-z_]\w*)\b/i;
 
@@ -90,6 +280,136 @@ function normalizeGluedBooleanKeywordColumns(sql: string): { sql: string; count:
     },
   );
   return { sql: normalized, count };
+}
+
+function collectTableAliases(sql: string, tableName: string): Set<string> {
+  const aliases = new Set<string>();
+
+  const collectOneReference = (index: number): number | null => {
+    const table = readSqlTableNameAfterFromOrJoin(sql, index);
+    if (!table) return null;
+
+    let end = table.end;
+    const alias = readOptionalSqlAliasToken(sql, table.end);
+    if (alias) end = alias.end;
+
+    if (table.tableName.toLowerCase() === tableName.toLowerCase()) {
+      aliases.add(tableName);
+      if (alias) aliases.add(alias.value);
+    }
+
+    return end;
+  };
+
+  const collectCommaSeparatedReferences = (index: number): number => {
+    let cursor = index;
+    while (cursor < sql.length) {
+      const end = collectOneReference(cursor);
+      if (end === null) break;
+      cursor = end;
+      while (cursor < sql.length && /\s/.test(sql[cursor])) cursor += 1;
+      if (sql[cursor] !== ',') break;
+      cursor += 1;
+    }
+    return cursor;
+  };
+
+  let i = 0;
+  while (i < sql.length) {
+    const skipped = skipSqlIgnoredText(sql, i);
+    if (skipped !== i) {
+      i = skipped;
+      continue;
+    }
+    if (!/[A-Za-z_]/.test(sql[i])) {
+      i += 1;
+      continue;
+    }
+
+    const wordStart = i;
+    while (i < sql.length && /[A-Za-z0-9_]/.test(sql[i])) i += 1;
+    const word = sql.slice(wordStart, i);
+    if (/^FROM$/i.test(word)) {
+      i = Math.max(i, collectCommaSeparatedReferences(i));
+      continue;
+    }
+    if (/^JOIN$/i.test(word)) {
+      const end = collectOneReference(i);
+      if (end !== null) i = Math.max(i, end);
+      continue;
+    }
+  }
+  return aliases;
+}
+
+function previousSqlWord(maskedSql: string, index: number): string | null {
+  let i = index - 1;
+  while (i >= 0 && /\s/.test(maskedSql[i])) i -= 1;
+  const end = i + 1;
+  while (i >= 0 && /[A-Za-z0-9_]/.test(maskedSql[i])) i -= 1;
+  if (end === i + 1) return null;
+  return maskedSql.slice(i + 1, end);
+}
+
+function replaceBareThreadMainThreadReferences(sql: string): { sql: string; count: number } {
+  const masked = maskSqlLiteralsCommentsAndQuotedIdentifiers(sql);
+  const matcher = /\bmain_thread\b/gi;
+  let match: RegExpExecArray | null;
+  let rewritten = '';
+  let lastIndex = 0;
+  let count = 0;
+
+  while ((match = matcher.exec(masked)) !== null) {
+    const start = match.index;
+    const end = matcher.lastIndex;
+    if (masked[start - 1] === '.' || /^AS$/i.test(previousSqlWord(masked, start) ?? '')) {
+      continue;
+    }
+
+    count += 1;
+    rewritten += sql.slice(lastIndex, start);
+    rewritten += 'is_main_thread';
+    lastIndex = end;
+  }
+
+  if (count === 0) return { sql, count: 0 };
+  rewritten += sql.slice(lastIndex);
+  return { sql: rewritten, count };
+}
+
+function hasCteNamed(sql: string, name: string): boolean {
+  const masked = maskSqlLiteralsCommentsAndQuotedIdentifiers(sql);
+  return new RegExp(`\\bWITH\\b[\\s\\S]*\\b${escapeRegExp(name)}\\s+AS\\s*\\(`, 'i').test(masked);
+}
+
+function normalizeThreadMainThreadColumn(sql: string): { sql: string; rewrites: string[] } {
+  if (hasCteNamed(sql, 'thread')) return { sql, rewrites: [] };
+
+  let normalized = sql;
+  const rewrites: string[] = [];
+  const threadAliases = collectTableAliases(sql, 'thread');
+  if (threadAliases.size === 0) return { sql, rewrites: [] };
+  let changedQualified = 0;
+
+  for (const alias of threadAliases) {
+    const pattern = new RegExp(`\\b${escapeRegExp(alias)}\\.main_thread\\b`, 'gi');
+    const result = replaceOutsideSqlLiteralsCommentsAndQuotedIdentifiers(normalized, pattern, () => {
+      changedQualified += 1;
+      return `${alias}.is_main_thread`;
+    });
+    normalized = result.sql;
+  }
+
+  let changedBare = 0;
+  const bareResult = replaceBareThreadMainThreadReferences(normalized);
+  changedBare += bareResult.count;
+  normalized = bareResult.sql;
+
+  if (changedQualified + changedBare > 0) {
+    rewrites.push('rewrote thread main_thread column to is_main_thread; Perfetto thread table uses is_main_thread');
+  }
+
+  return { sql: normalized, rewrites };
 }
 
 function normalizeBareSliceColumnsAfterJoins(sql: string): { sql: string; rewrites: string[] } {
@@ -202,7 +522,7 @@ function extractFrameIdPredicates(sql: string): string[] {
 }
 
 function normalizeUnsupportedIntrinsicBatchFrameRootCauseLookup(sql: string): { sql: string; rewrites: string[] } {
-  if (!/\bFROM\s+__intrinsic_batch_frame_root_cause\b/i.test(sql)) return { sql, rewrites: [] };
+  if (collectTableAliases(sql, '__intrinsic_batch_frame_root_cause').size === 0) return { sql, rewrites: [] };
 
   const frameIds = extractFrameIdPredicates(sql);
   const requestedFrames = frameIds.length > 0
@@ -307,6 +627,12 @@ export function normalizeRawSql(sql: string): RawSqlNormalizationResult {
   if (gluedBooleanColumns.count > 0) {
     normalized = gluedBooleanColumns.sql;
     rewrites.push('inserted missing whitespace between boolean operators and known Perfetto columns');
+  }
+
+  const threadMainThreadColumn = normalizeThreadMainThreadColumn(normalized);
+  if (threadMainThreadColumn.rewrites.length > 0) {
+    normalized = threadMainThreadColumn.sql;
+    rewrites.push(...threadMainThreadColumn.rewrites);
   }
 
   const sliceColumns = normalizeBareSliceColumnsAfterJoins(normalized);

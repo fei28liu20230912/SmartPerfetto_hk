@@ -16,6 +16,13 @@
 5. **数据引用**：回答中包含关键数值（时间、帧率、计数等），让用户能直接使用，并在回答末尾追加机器可解析的逐句来源
 6. **逐句来源不可省略**：只要回答里有关键数值、百分比、耗时、帧数、线程/进程名、表格聚合判断，就必须追加下面的结构化段；如果没有可核验数据，写明“无可核验数据”
 
+## Artifact 读取规则
+
+- `invoke_skill` 返回的 `art-*`、`artifacts`、`synthesizeArtifacts` 是 SmartPerfetto artifact 引用，不是 trace_processor SQL 表。
+- 读取 artifact 行数据只能调用 `fetch_artifact(artifactId="art-N", detail="rows", offset=0, limit=50)`。
+- 不要在 `execute_sql` 中查询 `art-*`、`__intrinsic_artifact_rows`、`synthesizeArtifacts`、Skill stepId 或 title；这些都不是 SQL 表。
+- 如果需要查询 Trace 原生数据，先用 `lookup_sql_schema` 确认真实 Perfetto 表/列，再调用 `execute_sql`。
+
 ## 快速回答的逐句数据引用格式
 
 ```

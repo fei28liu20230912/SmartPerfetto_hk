@@ -686,8 +686,8 @@ export interface ClaudeMcpServerOptions {
   referenceTraceId?: string;
   /** Pre-computed comparison context (capabilities, metadata) for get_comparison_context tool */
   comparisonContext?: import('./types').ComparisonContext;
-  /** Lightweight mode for quick queries — only registers core tools (execute_sql, invoke_skill, lookup_sql_schema).
-   *  Skips planning, hypothesis, knowledge, patterns, notes, artifacts, and comparison tools.
+  /** Lightweight mode for quick queries — only registers core data tools.
+   *  Skips planning, hypothesis, knowledge, patterns, notes, and comparison tools.
    *  Also disables the plan gate since planning tools are not available. */
   lightweight?: boolean;
   /** Per-analysis budget for skill-notes injection on invoke_skill responses.
@@ -751,6 +751,181 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       'Raw SQL 使用了进程/包名过滤；Process Identity Gate 只会自动保护 invoke_skill。信任这个 SQL 结论前，先用 process_identity_resolver 确认 canonical_package_name 与 recommended_process_name_param，或优先改用对应 Skill。',
       'Raw SQL uses process/package-name filters; Process Identity Gate only protects invoke_skill automatically. Before trusting this SQL result, verify canonical_package_name and recommended_process_name_param with process_identity_resolver, or prefer the matching skill.',
     );
+  }
+
+  function skipSqlQuotedText(sql: string, index: number, quote: string): number {
+    let i = index + 1;
+    while (i < sql.length) {
+      if (sql[i] === quote) {
+        if (sql[i + 1] === quote) {
+          i += 2;
+          continue;
+        }
+        return i + 1;
+      }
+      i += 1;
+    }
+    return sql.length;
+  }
+
+  function skipSqlIgnoredText(sql: string, index: number): number {
+    const char = sql[index];
+    const next = sql[index + 1];
+    if (char === '-' && next === '-') {
+      let i = index + 2;
+      while (i < sql.length && sql[i] !== '\n' && sql[i] !== '\r') i += 1;
+      return i;
+    }
+    if (char === '/' && next === '*') {
+      let i = index + 2;
+      while (i < sql.length && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1;
+      return Math.min(sql.length, i + 2);
+    }
+    if (char === '\'' || char === '"' || char === '`') return skipSqlQuotedText(sql, index, char);
+    if (char === '[') {
+      let i = index + 1;
+      while (i < sql.length && sql[i] !== ']') i += 1;
+      return Math.min(sql.length, i + 1);
+    }
+    return index;
+  }
+
+  function readSqlIdentifierToken(sql: string, index: number): { value: string; end: number } | null {
+    const char = sql[index];
+    if (char === '\'' || char === '"' || char === '`') {
+      const end = skipSqlQuotedText(sql, index, char);
+      const inner = sql.slice(index + 1, end - 1).split(`${char}${char}`).join(char);
+      return { value: inner, end };
+    }
+    if (char === '[') {
+      const end = skipSqlIgnoredText(sql, index);
+      return { value: sql.slice(index + 1, end - 1), end };
+    }
+
+    let i = index;
+    while (i < sql.length && /[A-Za-z0-9_$-]/.test(sql[i])) i += 1;
+    if (i === index) return null;
+    return { value: sql.slice(index, i), end: i };
+  }
+
+  function readSqlTableNameAfterFromOrJoin(sql: string, index: number): { tableName: string; end: number } | null {
+    let i = index;
+    while (i < sql.length && /\s/.test(sql[i])) i += 1;
+    if (sql[i] === '(') return null;
+
+    let token = readSqlIdentifierToken(sql, i);
+    if (!token) return null;
+    let tableName = token.value;
+    i = token.end;
+
+    while (i < sql.length && /\s/.test(sql[i])) i += 1;
+    if (sql[i] === '.') {
+      i += 1;
+      while (i < sql.length && /\s/.test(sql[i])) i += 1;
+      token = readSqlIdentifierToken(sql, i);
+      if (!token) return { tableName, end: i };
+      tableName = token.value;
+      i = token.end;
+    }
+
+    return { tableName, end: i };
+  }
+
+  const tableAliasBoundaryWord = /^(WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|CROSS|FULL|NATURAL|GROUP|ORDER|LIMIT|ON|USING|HAVING|UNION|EXCEPT|INTERSECT|WINDOW|QUALIFY|VALUES)$/i;
+
+  function readOptionalSqlAliasEnd(sql: string, index: number): number {
+    let i = index;
+    while (i < sql.length && /\s/.test(sql[i])) i += 1;
+    const asMatch = /^AS\b/i.exec(sql.slice(i));
+    if (asMatch) {
+      i += asMatch[0].length;
+      while (i < sql.length && /\s/.test(sql[i])) i += 1;
+    }
+
+    const token = readSqlIdentifierToken(sql, i);
+    if (!token || tableAliasBoundaryWord.test(token.value)) return index;
+    return token.end;
+  }
+
+  function isArtifactPseudoTableName(tableName: string): boolean {
+    const lower = tableName.toLowerCase();
+    return (
+      lower !== '__intrinsic_batch_frame_root_cause' &&
+      (
+        /^__intrinsic_[a-z_]\w*$/i.test(tableName) ||
+        /^art-\d+$/i.test(tableName) ||
+        lower === 'synthesizeartifacts' ||
+        lower === 'synthesize_artifacts' ||
+        lower === 'artifacts'
+      )
+    );
+  }
+
+  function findArtifactPseudoTableNameInReference(sql: string, index: number): { tableName: string | null; end: number | null } {
+    const table = readSqlTableNameAfterFromOrJoin(sql, index);
+    if (!table) return { tableName: null, end: null };
+    const end = readOptionalSqlAliasEnd(sql, table.end);
+    return {
+      tableName: isArtifactPseudoTableName(table.tableName) ? table.tableName : null,
+      end: Math.max(table.end, end),
+    };
+  }
+
+  function findArtifactPseudoTableName(sql: string): string | null {
+    let i = 0;
+    while (i < sql.length) {
+      const skipped = skipSqlIgnoredText(sql, i);
+      if (skipped !== i) {
+        i = skipped;
+        continue;
+      }
+
+      if (/[A-Za-z_]/.test(sql[i])) {
+        const wordStart = i;
+        while (i < sql.length && /[A-Za-z0-9_]/.test(sql[i])) i += 1;
+        const word = sql.slice(wordStart, i);
+        if (/^FROM$/i.test(word)) {
+          while (i < sql.length) {
+            const reference = findArtifactPseudoTableNameInReference(sql, i);
+            if (reference.tableName) return reference.tableName;
+            if (reference.end === null) break;
+            i = reference.end;
+            while (i < sql.length && /\s/.test(sql[i])) i += 1;
+            if (sql[i] !== ',') break;
+            i += 1;
+          }
+          continue;
+        }
+        if (/^JOIN$/i.test(word)) {
+          const reference = findArtifactPseudoTableNameInReference(sql, i);
+          if (reference.tableName) return reference.tableName;
+          if (reference.end !== null) i = Math.max(i, reference.end);
+        }
+        continue;
+      }
+
+      i += 1;
+    }
+
+    return null;
+  }
+
+  function artifactSqlMisuseHint(sql: string, language: OutputLanguage): Record<string, unknown> | null {
+    const tableName = findArtifactPseudoTableName(sql);
+    if (!tableName) return null;
+
+    return {
+      success: false,
+      blocked: true,
+      error: localize(
+        language,
+        `${tableName} 不是 trace_processor SQL 表。Skill 返回的 art-* / synthesizeArtifacts 是 SmartPerfetto artifact 引用，不能用 execute_sql 查询。`,
+        `${tableName} is not a trace_processor SQL table. art-* / synthesizeArtifacts from Skill results are SmartPerfetto artifact references and cannot be queried with execute_sql.`,
+      ),
+      action_required: 'fetch_artifact',
+      hint: 'Use fetch_artifact(artifactId="art-N", detail="rows", offset=0, limit=50) with the artifactId returned by invoke_skill.',
+      sql,
+    };
   }
 
   /**
@@ -1285,6 +1460,13 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       ? undefined
       : activePlanPhaseForEvidence(toolName, input);
     const phase = phaseResolution?.phase;
+    const lightweightPhase = !phaseOverride?.phaseId && !phase?.id && options.lightweight
+      ? {
+          id: 'quick',
+          name: localize(outputLanguage, '快速回答', 'Quick answer'),
+          goal: localize(outputLanguage, '用轻量工具链快速回答当前问题', 'Answer the current question with the lightweight tool chain.'),
+        }
+      : undefined;
     const paramsHash = summary.paramsHash || evidenceHash(input);
     const ordinal = ++evidenceProducerOrdinal;
     const sourceToolCallId = [
@@ -1296,10 +1478,10 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     return {
       sourceToolCallId,
       paramsHash,
-      planPhaseId: phaseOverride?.phaseId ?? phase?.id,
-      planPhaseTitle: phaseOverride?.phaseTitle ?? phase?.name,
-      planPhaseGoal: phaseOverride?.phaseGoal ?? phase?.goal,
-      planPhaseAttribution: phaseOverride?.attribution ?? phaseResolution?.attribution,
+      planPhaseId: phaseOverride?.phaseId ?? phase?.id ?? lightweightPhase?.id,
+      planPhaseTitle: phaseOverride?.phaseTitle ?? phase?.name ?? lightweightPhase?.name,
+      planPhaseGoal: phaseOverride?.phaseGoal ?? phase?.goal ?? lightweightPhase?.goal,
+      planPhaseAttribution: phaseOverride?.attribution ?? (lightweightPhase ? 'active' : phaseResolution?.attribution),
       planPhaseWarning: phaseOverride?.warning ?? phaseResolution?.warning,
       toolNarration: formatToolCallNarration(toolName, input, outputLanguage),
       producerReason,
@@ -1377,7 +1559,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     'Returns columnar results. Set summary=true for large result sets to get column statistics + sample rows.\n\n' +
     'Use when: ad-hoc queries not covered by existing skills, verifying hypotheses with specific SQL, checking raw data.\n' +
     'Don\'t use when: a matching skill exists (use invoke_skill instead — richer layered output), or you need schema info (use lookup_sql_schema first).\n\n' +
-    'SQL safety rules: qualify duplicate column names after JOINs. Do not write bare SELECT name/ts/dur when joining slice/thread/process; use s.name AS slice_name, s.ts, s.dur, t.name AS thread_name, p.name AS process_name, or prefer the thread_slice stdlib view. FrameTimeline rows expose upid, not utid/process_name; use JOIN process USING(upid) for actual_frame_timeline_slice. thread_slice does not expose self_dur directly; JOIN slice_self_dur USING(id) when self time is needed. When using thread_slice, read thread_name and process_name directly; do not write t.name or p.name unless JOIN thread t or JOIN process p is present. Do not query __intrinsic_* names or skill step names such as batch_frame_root_cause as SQL tables; they are skill artifacts, use fetch_artifact for those rows.\n\n' +
+    'SQL safety rules: qualify duplicate column names after JOINs. Do not write bare SELECT name/ts/dur when joining slice/thread/process; use s.name AS slice_name, s.ts, s.dur, t.name AS thread_name, p.name AS process_name, or prefer the thread_slice stdlib view. FrameTimeline rows expose upid, not utid/process_name; use JOIN process USING(upid) for actual_frame_timeline_slice. thread_slice does not expose self_dur directly; JOIN slice_self_dur USING(id) when self time is needed. When using thread_slice, read thread_name and process_name directly; do not write t.name or p.name unless JOIN thread t or JOIN process p is present. The thread table main-thread column is is_main_thread, not main_thread. Do not query __intrinsic_* names or skill step names such as batch_frame_root_cause as SQL tables; they are skill artifacts, use fetch_artifact for those rows.\n\n' +
     'Examples:\n' +
     '1. Count jank frames: sql="SELECT COUNT(*) as jank_count FROM actual_frame_timeline_slice WHERE jank_type != \'None\'", summary=false\n' +
     '2. CPU frequency overview: sql="SELECT cpu, MIN(value) as min_freq, MAX(value) as max_freq, AVG(value) as avg_freq FROM counter JOIN counter_track ON counter.track_id=counter_track.id WHERE counter_track.name GLOB \'cpu*freq\' GROUP BY cpu", summary=true\n' +
@@ -1395,6 +1577,13 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       const planError = requirePlan('execute_sql');
       if (planError) {
         return { content: [{ type: 'text' as const, text: planError }] };
+      }
+      const artifactSqlHint = artifactSqlMisuseHint(sql, outputLanguage);
+      if (artifactSqlHint) {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(artifactSqlHint) }],
+          isError: true,
+        };
       }
       const producer = createEvidenceProducerContext(
         'execute_sql',
@@ -3653,7 +3842,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     'Use "current" for the primary trace, "reference" for the comparison trace.\n\n' +
     'Use when: you need to drill into a specific trace during comparison analysis, ' +
     'or verify a finding from compare_skill with more targeted SQL.\n\n' +
-    'SQL safety rules: qualify duplicate column names after JOINs. Do not write bare SELECT name/ts/dur when joining slice/thread/process; use s.name AS slice_name, s.ts, s.dur, t.name AS thread_name, p.name AS process_name, or prefer the thread_slice stdlib view. FrameTimeline rows expose upid, not utid/process_name; use JOIN process USING(upid) for actual_frame_timeline_slice. thread_slice does not expose self_dur directly; JOIN slice_self_dur USING(id) when self time is needed. When using thread_slice, read thread_name and process_name directly; do not write t.name or p.name unless JOIN thread t or JOIN process p is present.\n\n' +
+    'SQL safety rules: qualify duplicate column names after JOINs. Do not write bare SELECT name/ts/dur when joining slice/thread/process; use s.name AS slice_name, s.ts, s.dur, t.name AS thread_name, p.name AS process_name, or prefer the thread_slice stdlib view. FrameTimeline rows expose upid, not utid/process_name; use JOIN process USING(upid) for actual_frame_timeline_slice. thread_slice does not expose self_dur directly; JOIN slice_self_dur USING(id) when self time is needed. When using thread_slice, read thread_name and process_name directly; do not write t.name or p.name unless JOIN thread t or JOIN process p is present. The thread table main-thread column is is_main_thread, not main_thread.\n\n' +
     'Examples:\n' +
     '1. Check reference trace jank: trace="reference", sql="SELECT COUNT(*) FROM actual_frame_timeline_slice WHERE jank_type != \'None\'"\n' +
     '2. Compare CPU freq: trace="current", sql="SELECT cpu, AVG(value) as avg_freq FROM counter JOIN counter_track ON counter.track_id=counter_track.id WHERE counter_track.name GLOB \'cpu*freq\' GROUP BY cpu"',
@@ -3670,6 +3859,13 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       const planError = requirePlan('execute_sql_on');
       if (planError) {
         return { content: [{ type: 'text' as const, text: planError }] };
+      }
+      const artifactSqlHint = artifactSqlMisuseHint(sql, outputLanguage);
+      if (artifactSqlHint) {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(artifactSqlHint) }],
+          isError: true,
+        };
       }
       const targetTraceId = trace === 'reference' ? referenceTraceId : traceId;
       const traceLabel = trace === 'reference'
@@ -4003,12 +4199,15 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
   const registry = new McpToolRegistry();
 
   if (options.lightweight) {
-    // Lightweight mode: only 3 core data-access tools — no planning,
+    // Lightweight mode: core data-access tools only — no planning,
     // hypothesis, notes, or advanced tools. Plan gate is automatically
     // disabled because analysisPlan is not passed in lightweight mode.
+    // `invoke_skill` returns artifact references, so `fetch_artifact` must
+    // stay available or lightweight models try to query artifact IDs as SQL.
     registry.registerSdk(executeSql, 'execute_sql', 'public');
     registry.registerSdk(invokeSkill, 'invoke_skill', 'public');
     registry.registerSdk(lookupSqlSchema, 'lookup_sql_schema', 'public');
+    if (fetchArtifact) registry.registerSdk(fetchArtifact, 'fetch_artifact', 'public');
   } else {
     // Full mode: all always-on tools + conditional tools.
     registry.registerSdk(executeSql, 'execute_sql', 'public');

@@ -67,4 +67,12 @@ describe('strategyLoader tolerates leading SPDX HTML comments', () => {
     expect(content).toContain('source_ref=<表 1/摘要 1>');
     expect(content).toContain('column=<列名>; value=<原始值>');
   });
+
+  it('keeps the quick prompt wired to fetch Skill artifacts instead of querying pseudo-tables', () => {
+    const content = loadPromptTemplate('prompt-quick');
+    expect(content).toContain('## Artifact 读取规则');
+    expect(content).toContain('fetch_artifact(artifactId="art-N", detail="rows", offset=0, limit=50)');
+    expect(content).toContain('__intrinsic_artifact_rows');
+    expect(content).toContain('这些都不是 SQL 表');
+  });
 });

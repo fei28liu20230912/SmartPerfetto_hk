@@ -151,7 +151,7 @@ import { ArtifactStore } from '../artifactStore';
 
 type ToolDef = { name: string; schema?: Record<string, any>; handler: (...args: any[]) => any };
 
-function createTestServer(options: { referenceTraceId?: string; sceneType?: any } = {}) {
+function createTestServer(options: { referenceTraceId?: string; sceneType?: any; lightweight?: boolean } = {}) {
   const analysisNotes: AnalysisNote[] = [];
   const hypotheses: Hypothesis[] = [];
   const uncertaintyFlags: UncertaintyFlag[] = [];
@@ -191,11 +191,11 @@ function createTestServer(options: { referenceTraceId?: string; sceneType?: any 
     analysisNotes,
     hypotheses,
     uncertaintyFlags,
-    analysisPlan,
     watchdogWarning,
     artifactStore: new ArtifactStore() as any,
     emitUpdate: (u: any) => emittedUpdates.push(u),
     sceneType: options.sceneType,
+    ...(options.lightweight ? { lightweight: true } : { analysisPlan }),
     ...(options.referenceTraceId ? {
       referenceTraceId: options.referenceTraceId,
       comparisonContext: {
@@ -318,6 +318,19 @@ describe('createClaudeMcpServer', () => {
       for (const name of expected) {
         expect(tools.has(name)).toBe(true);
       }
+    });
+
+    it('keeps fetch_artifact available in lightweight mode for skill artifacts', () => {
+      const { tools, allowedTools } = createTestServer({ lightweight: true });
+
+      expect([...tools.keys()].sort()).toEqual([
+        'execute_sql',
+        'fetch_artifact',
+        'invoke_skill',
+        'lookup_sql_schema',
+      ]);
+      expect(allowedTools).toContain(MCP_NAME_PREFIX + 'fetch_artifact');
+      expect(tools.has('submit_plan')).toBe(false);
     });
   });
 
@@ -571,6 +584,94 @@ describe('createClaudeMcpServer', () => {
         phaseId: 'p1',
         status: 'in_progress',
       });
+    });
+
+    it('blocks artifact pseudo-tables before executing raw SQL', async () => {
+      const { tools, emittedUpdates, mockTpService } = createTestServer({ lightweight: true });
+
+      const result = await callTool(tools, 'execute_sql', {
+        sql: "SELECT * FROM __intrinsic_artifact_rows WHERE artifact_id='art-2'",
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.blocked).toBe(true);
+      expect(result.action_required).toBe('fetch_artifact');
+      expect(result.hint).toContain('fetch_artifact');
+      expect(mockTpService.query).not.toHaveBeenCalled();
+      expect(emittedUpdates.filter((u: any) => u.type === 'data')).toHaveLength(0);
+    });
+
+    it('blocks synthesizeArtifacts pseudo-table names before executing raw SQL', async () => {
+      const { tools, mockTpService } = createTestServer({ lightweight: true });
+
+      const result = await callTool(tools, 'execute_sql', {
+        sql: 'SELECT * FROM synthesizeArtifacts',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.action_required).toBe('fetch_artifact');
+      expect(mockTpService.query).not.toHaveBeenCalled();
+    });
+
+    it('blocks quoted artifact pseudo-tables before executing raw SQL', async () => {
+      const { tools, mockTpService } = createTestServer({ lightweight: true });
+
+      const doubleQuoted = await callTool(tools, 'execute_sql', {
+        sql: 'SELECT * FROM "art-2"',
+      });
+      const bracketQuoted = await callTool(tools, 'execute_sql', {
+        sql: 'SELECT * FROM [__intrinsic_artifact_rows]',
+      });
+
+      expect(doubleQuoted.success).toBe(false);
+      expect(doubleQuoted.action_required).toBe('fetch_artifact');
+      expect(bracketQuoted.success).toBe(false);
+      expect(bracketQuoted.action_required).toBe('fetch_artifact');
+      expect(mockTpService.query).not.toHaveBeenCalled();
+    });
+
+    it('blocks artifact pseudo-tables in comma-joined table lists', async () => {
+      const { tools, mockTpService } = createTestServer({ lightweight: true });
+
+      const result = await callTool(tools, 'execute_sql', {
+        sql: 'SELECT * FROM slice s, "art-2" a WHERE s.id = a.slice_id',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.action_required).toBe('fetch_artifact');
+      expect(mockTpService.query).not.toHaveBeenCalled();
+    });
+
+    it('does not block artifact-looking text inside SQL string literals', async () => {
+      const { tools, mockTpService } = createTestServer({ lightweight: true });
+
+      const result = await callTool(tools, 'execute_sql', {
+        sql: "SELECT 'FROM art-2' AS note",
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(result.traceSide).toBe('current');
+      expect(mockTpService.query).toHaveBeenCalledWith('test-trace-123', expect.stringContaining("SELECT 'FROM art-2' AS note"));
+    });
+
+    it('binds lightweight evidence to the synthetic quick phase', async () => {
+      const { tools, emittedUpdates } = createTestServer({ lightweight: true });
+
+      const result = await callTool(tools, 'invoke_skill', {
+        skillId: 'scrolling_analysis',
+        params: { process_name: 'com.example' },
+      });
+
+      const envelope = emittedUpdates
+        .filter((u: any) => u.type === 'data')
+        .flatMap((u: any) => u.content ?? [])
+        .find((env: any) => env.meta?.skillId === 'scrolling_analysis');
+
+      expect(result.success).toBe(true);
+      expect(result.artifacts?.[0]?.planPhaseId).toBe('quick');
+      expect(envelope?.meta?.planPhaseId).toBe('quick');
+      expect(envelope?.meta?.planPhaseTitle).toBe('快速回答');
+      expect(envelope?.meta?.planPhaseAttribution).toBe('active');
     });
 
     it('normalizes actual_frame_timeline_slice process lookup before executing raw SQL', async () => {
