@@ -1,0 +1,285 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# HDCP 对合成路径影响分析（原子 Skill）v1.0
+# =============================================================================
+# TV 场景专用：检测 HDCP 受保护内容对 HWC overlay/client composition 路径的影响。
+# HDCP 是 TV 必备功能，受保护内容（Netflix/Disney+ DRM 视频）必须走 HWC overlay，
+# 这限制了 SurfaceFlinger 的合成策略，可能导致：
+# - Client composition 降级 → GPU 合成开销增加
+# - Secure buffer 无法被 GPU 读取 → overlay plane 数量受限
+# - HDCP 握手失败 → 内容降级或播放失败
+#
+# 数据源依赖：trace 需包含 gfx atrace category
+
+name: hdcp_composition_path
+version: "1.0"
+type: atomic
+category: tv_display
+tier: B
+
+meta:
+  display_name: "HDCP 合成路径分析"
+  description: "检测 HDCP 受保护内容对 HWC 合成路径的影响，TV DRM 场景专用"
+  icon: "lock"
+  tags: [tv, hdcp, drm, secure, overlay, composition, atomic]
+
+triggers:
+  keywords:
+    zh: [HDCP, DRM, 受保护内容, 安全通道, 加密视频, 合成降级, secure overlay]
+    en: [hdcp, drm, protected content, secure, widevine, composition fallback]
+  patterns:
+    - ".*(HDCP|DRM|受保护|secure).*(合成|降级|overlay|播放).*"
+    - ".*(hdcp|drm|protected|secure|widevine).*(composition|fallback|overlay|playback).*"
+
+prerequisites:
+  required_tables:
+    - slice
+    - counter
+    - counter_track
+    - thread_track
+    - thread
+    - process
+
+inputs:
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+
+steps:
+  # Step 1: HDCP 认证状态
+  - id: hdcp_auth_status
+    type: atomic
+    name: "HDCP 认证状态"
+    display:
+      level: summary
+      layer: overview
+      title: "HDCP 认证状态"
+      columns:
+        - name: event_type
+          label: "事件类型"
+          type: string
+        - name: count
+          label: "次数"
+          type: number
+        - name: first_ts_ms
+          label: "首次(ms)"
+          type: number
+        - name: last_ts_ms
+          label: "最后(ms)"
+          type: number
+        - name: process_name
+          label: "进程"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      hdcp_slices AS (
+        SELECT
+          s.ts,
+          s.dur,
+          s.name AS slice_name,
+          COALESCE(p.name, t.name) AS process_name,
+          CASE
+            WHEN s.name GLOB '*HDCP*auth*' OR s.name GLOB '*hdcp*auth*' THEN 'auth'
+            WHEN s.name GLOB '*HDCP*fail*' OR s.name GLOB '*hdcp*fail*' THEN 'auth_fail'
+            WHEN s.name GLOB '*HDCP*revoke*' OR s.name GLOB '*hdcp*revoke*' THEN 'revoke'
+            WHEN s.name GLOB '*HDCP*topology*' THEN 'topology'
+            WHEN s.name GLOB '*hdcp*enable*' OR s.name GLOB '*HDCP*enable*' THEN 'enable'
+            ELSE 'other_hdcp'
+          END AS event_type
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        LEFT JOIN process p ON t.upid = p.upid
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts AND s.ts < i.end_ts
+          AND s.dur > 0
+          AND (s.name GLOB '*HDCP*' OR s.name GLOB '*hdcp*')
+      )
+      SELECT
+        event_type,
+        COUNT(*) AS count,
+        ROUND(MIN(ts) / 1e6, 2) AS first_ts_ms,
+        ROUND(MAX(ts) / 1e6, 2) AS last_ts_ms,
+        process_name
+      FROM hdcp_slices
+      GROUP BY event_type, process_name
+      ORDER BY count DESC
+    save_as: hdcp_auth_events
+
+  # Step 2: Secure/DRM buffer 活动检测
+  - id: secure_buffer_activity
+    type: atomic
+    name: "Secure Buffer 活动"
+    display:
+      level: detail
+      layer: list
+      title: "Secure/DRM Buffer 活动"
+      columns:
+        - name: ts
+          label: "时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: dur_ms
+          label: "耗时"
+          type: duration
+          format: duration_ms
+        - name: slice_name
+          label: "Slice"
+          type: string
+        - name: thread_name
+          label: "线程"
+          type: string
+        - name: process_name
+          label: "进程"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      secure_slices AS (
+        SELECT
+          s.ts,
+          s.dur,
+          s.name AS slice_name,
+          COALESCE(t.name, '<unnamed>') AS thread_name,
+          COALESCE(p.name, '<kernel>') AS process_name,
+          ROUND(s.dur / 1e6, 2) AS dur_ms
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        LEFT JOIN process p ON t.upid = p.upid
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts AND s.ts < i.end_ts
+          AND s.dur > 0
+          AND (
+            s.name GLOB '*secure*' OR s.name GLOB '*Secure*' OR
+            s.name GLOB '*SECURE*' OR
+            s.name GLOB '*DRM*' OR s.name GLOB '*drm*' OR
+            s.name GLOB '*Widevine*' OR s.name GLOB '*widevine*' OR
+            s.name GLOB '*Crypto*' OR s.name GLOB '*crypto*'
+          )
+      )
+      SELECT
+        printf('%d', ts) AS ts,
+        dur_ms,
+        slice_name,
+        thread_name,
+        process_name
+      FROM secure_slices
+      ORDER BY dur DESC
+      LIMIT 100
+    save_as: secure_buffer_events
+
+  # Step 3: HWC Overlay vs Client Composition 在 DRM 内容期间的对比
+  - id: drm_composition_path_analysis
+    type: atomic
+    name: "DRM 内容合成路径分析"
+    display:
+      level: summary
+      layer: overview
+      title: "DRM 内容期间 HWC 合成路径"
+      columns:
+        - name: period
+          label: "时段"
+          type: string
+        - name: composition_type
+          label: "合成类型"
+          type: string
+        - name: event_count
+          label: "次数"
+          type: number
+        - name: avg_dur_ms
+          label: "平均耗时"
+          type: duration
+          format: duration_ms
+        - name: max_dur_ms
+          label: "最大耗时"
+          type: duration
+          format: duration_ms
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      -- 检测是否有 DRM/secure 信号
+      drm_signal AS (
+        SELECT MIN(ts) AS drm_start, MAX(ts + dur) AS drm_end
+        FROM slice
+        CROSS JOIN input i
+        WHERE ts >= i.start_ts AND ts < i.end_ts
+          AND (name GLOB '*DRM*' OR name GLOB '*Widevine*' OR name GLOB '*secure*buffer*')
+      ),
+      -- SurfaceFlinger 合成事件
+      sf_composition AS (
+        SELECT
+          s.ts,
+          s.dur,
+          CASE
+            WHEN s.name GLOB '*client*composition*' OR s.name GLOB '*clientComposition*'
+              OR s.name GLOB '*CLIENT*' THEN 'client'
+            WHEN s.name GLOB '*DEVICE*' OR s.name GLOB '*overlay*' OR s.name GLOB '*Overlay*'
+              THEN 'device_overlay'
+            ELSE 'other_sf'
+          END AS composition_type,
+          ROUND(s.dur / 1e6, 2) AS dur_ms
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        CROSS JOIN input i
+        WHERE t.name = 'SurfaceFlinger'
+          AND s.ts >= i.start_ts AND s.ts < i.end_ts
+          AND s.dur > 0
+      ),
+      -- 划分时段
+      with_period AS (
+        SELECT
+          CASE
+            WHEN (SELECT drm_start FROM drm_signal) IS NULL THEN '无DRM信号'
+            WHEN s.ts >= (SELECT drm_start FROM drm_signal)
+              AND s.ts <= (SELECT drm_end FROM drm_signal) THEN 'DRM期间'
+            ELSE '非DRM期间'
+          END AS period,
+          s.composition_type,
+          s.dur_ms
+        FROM sf_composition s
+      )
+      SELECT
+        period,
+        composition_type,
+        COUNT(*) AS event_count,
+        ROUND(AVG(dur_ms), 2) AS avg_dur_ms,
+        ROUND(MAX(dur_ms), 2) AS max_dur_ms
+      FROM with_period
+      WHERE composition_type IN ('client', 'device_overlay')
+      GROUP BY period, composition_type
+      ORDER BY period, composition_type
+    save_as: drm_composition_path
+
+output:
+  format: structured
+  fields:
+    - name: hdcp_auth_events
+      description: "HDCP 认证状态"
+    - name: secure_buffer_events
+      description: "Secure/DRM Buffer 活动"
+    - name: drm_composition_path
+      description: "DRM 内容期间 HWC 合成路径对比"

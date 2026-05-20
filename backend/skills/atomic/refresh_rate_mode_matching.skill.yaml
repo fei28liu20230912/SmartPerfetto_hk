@@ -1,0 +1,458 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# TV 刷新率模式匹配质量分析（原子 Skill）v1.0
+# =============================================================================
+# TV 场景核心 Skill：分析内容帧率 vs 显示刷新率的匹配质量。
+# TV 跟手机不同，需要频繁在 24/25/30/50/60/120Hz 间切换以匹配不同内容。
+# 不匹配时产生 3:2 pulldown 抖动或帧丢弃，影响观影体验。
+#
+# 本 Skill 检测：
+# - 当前内容帧率 vs 显示刷新率匹配状态
+# - 3:2 pulldown 检测（24fps 内容在 60Hz 显示）
+# - 刷新率切换事件及期间丢帧/黑屏
+# - VSync 间隔稳定性分析
+#
+# 数据源依赖：trace 需包含 gfx atrace category
+
+name: refresh_rate_mode_matching
+version: "1.0"
+type: atomic
+category: tv_display
+tier: A
+
+meta:
+  display_name: "TV 刷新率匹配质量"
+  description: "分析内容帧率 vs 显示刷新率匹配质量，检测 3:2 pulldown 和切换丢帧"
+  icon: "sync_alt"
+  tags: [tv, refresh_rate, frame_rate, pulldown, mode_switch, atomic]
+
+triggers:
+  keywords:
+    zh: [刷新率匹配, 帧率匹配, 3:2 pulldown, 抖动, 刷新率切换, 模式切换, 黑屏切换]
+    en: [refresh rate matching, frame rate matching, pulldown, judder, mode switch]
+  patterns:
+    - ".*(刷新率|帧率).*(匹配|切换|抖动|pulldown).*"
+    - ".*(refresh.?rate|frame.?rate).*(match|switch|judder|pulldown).*"
+
+prerequisites:
+  required_tables:
+    - counter
+    - counter_track
+    - slice
+  modules:
+    - counters.intervals
+
+inputs:
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+
+steps:
+  # Step 1: 刷新率分布与内容帧率匹配分析
+  - id: refresh_rate_content_matching
+    type: atomic
+    name: "刷新率-内容匹配分析"
+    display:
+      level: summary
+      layer: overview
+      title: "刷新率与内容帧率匹配状态"
+      columns:
+        - name: display_rate
+          label: "显示刷新率"
+          type: string
+        - name: frame_count
+          label: "帧数"
+          type: number
+          format: compact
+        - name: percentage
+          label: "占比"
+          type: percentage
+          format: percentage
+        - name: optimal_content_rate
+          label: "最佳内容帧率"
+          type: string
+        - name: match_quality
+          label: "匹配质量"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, MIN(ts)) AS start_ts,
+          COALESCE(${end_ts}, MAX(ts)) AS end_ts
+        FROM counter
+      ),
+      vsync_intervals AS (
+        SELECT
+          interval.ts,
+          interval.dur AS interval_ns
+        FROM counter_leading_intervals!((
+          SELECT c.*
+          FROM counter c
+          JOIN counter_track t ON c.track_id = t.id
+          WHERE (t.name GLOB '*VSYNC-sf*' OR t.name = 'VSYNC')
+        )) AS interval
+        WHERE interval.ts >= (SELECT start_ts FROM input)
+          AND interval.ts <= (SELECT end_ts FROM input)
+      ),
+      interval_buckets AS (
+        SELECT
+          interval_ns,
+          CASE
+            WHEN interval_ns < 6500000 THEN '120Hz'
+            WHEN interval_ns < 8500000 THEN '120Hz'
+            WHEN interval_ns < 11500000 THEN '90Hz'
+            WHEN interval_ns < 17500000 THEN '60Hz'
+            WHEN interval_ns < 30000000 THEN '50Hz'
+            WHEN interval_ns < 38000000 THEN '30Hz'
+            WHEN interval_ns < 42000000 THEN '24Hz'
+            ELSE 'Other'
+          END AS display_rate,
+          CASE
+            WHEN interval_ns < 6500000 THEN 1
+            WHEN interval_ns < 8500000 THEN 2
+            WHEN interval_ns < 11500000 THEN 3
+            WHEN interval_ns < 17500000 THEN 4
+            WHEN interval_ns < 30000000 THEN 5
+            WHEN interval_ns < 38000000 THEN 6
+            WHEN interval_ns < 42000000 THEN 7
+            ELSE 8
+          END AS bucket_order
+        FROM vsync_intervals
+        WHERE interval_ns IS NOT NULL
+          AND interval_ns > 5500000
+          AND interval_ns < 50000000
+      ),
+      with_quality AS (
+        SELECT
+          display_rate,
+          interval_ns,
+          bucket_order,
+          CASE
+            -- 120Hz: 完美匹配 120/60/40/30/24fps 内容
+            WHEN display_rate = '120Hz' THEN '优秀'
+            -- 60Hz: 匹配 60/30fps，24fps 会 3:2 pulldown
+            WHEN display_rate = '60Hz' THEN '良好(24fps内容会抖动)'
+            -- 50Hz: 匹配 50/25fps，24fps 4%加速
+            WHEN display_rate = '50Hz' THEN '良好(24fps内容4%加速)'
+            -- 30Hz: 只匹配 30fps，其他都差
+            WHEN display_rate = '30Hz' THEN '差(仅匹配30fps)'
+            -- 24Hz: 完美匹配 24fps 电影
+            WHEN display_rate = '24Hz' THEN '优秀(电影模式)'
+            WHEN display_rate = '90Hz' THEN '一般(24fps不整除)'
+            ELSE '未知'
+          END AS match_quality,
+          CASE
+            WHEN display_rate = '120Hz' THEN '120/60/40/30/24fps'
+            WHEN display_rate = '60Hz' THEN '60/30fps'
+            WHEN display_rate = '50Hz' THEN '50/25fps'
+            WHEN display_rate = '30Hz' THEN '30fps'
+            WHEN display_rate = '24Hz' THEN '24fps'
+            WHEN display_rate = '90Hz' THEN '90/45/30fps'
+            ELSE '-'
+          END AS optimal_content_rate
+        FROM interval_buckets
+      )
+      SELECT
+        display_rate,
+        COUNT(*) AS frame_count,
+        ROUND(100.0 * COUNT(*) / NULLIF(SUM(COUNT(*)) OVER (), 0), 2) AS percentage,
+        optimal_content_rate,
+        match_quality
+      FROM with_quality
+      GROUP BY display_rate, bucket_order, optimal_content_rate, match_quality
+      ORDER BY bucket_order
+    save_as: refresh_content_match
+
+  # Step 2: 3:2 Pulldown 检测
+  - id: pulldown_detection
+    type: atomic
+    name: "3:2 Pulldown 检测"
+    display:
+      level: detail
+      layer: list
+      title: "3:2 Pulldown 抖动检测"
+      columns:
+        - name: ts
+          label: "时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: interval_ms
+          label: "VSync间隔"
+          type: duration
+          format: duration_ms
+        - name: expected_ms
+          label: "期望间隔"
+          type: duration
+          format: duration_ms
+        - name: deviation_ms
+          label: "偏差"
+          type: duration
+          format: duration_ms
+        - name: is_pulldown
+          label: "Pulldown帧"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, MIN(ts)) AS start_ts,
+          COALESCE(${end_ts}, MAX(ts)) AS end_ts
+        FROM counter
+      ),
+      vsync_intervals AS (
+        SELECT
+          interval.ts,
+          interval.dur AS interval_ns
+        FROM counter_leading_intervals!((
+          SELECT c.*
+          FROM counter c
+          JOIN counter_track t ON c.track_id = t.id
+          WHERE (t.name GLOB '*VSYNC-sf*' OR t.name = 'VSYNC')
+        )) AS interval
+        WHERE interval.ts >= (SELECT start_ts FROM input)
+          AND interval.ts <= (SELECT end_ts FROM input)
+      ),
+      filtered AS (
+        SELECT
+          ts,
+          interval_ns,
+          ROUND(interval_ns / 1e6, 2) AS interval_ms
+        FROM vsync_intervals
+        WHERE interval_ns IS NOT NULL
+          AND interval_ns > 5500000
+          AND interval_ns < 50000000
+      ),
+      -- 3:2 pulldown 特征：在 60Hz 显示 24fps 内容时，帧间隔交替为 2VSync 和 3VSync
+      -- 即约 33.3ms 和 约 50ms 交替出现
+      with_expected AS (
+        SELECT
+          ts,
+          interval_ns,
+          interval_ms,
+          -- 如果中位间隔接近 16.67ms (60Hz)，检查是否有 2:3 交替
+          CASE
+            WHEN interval_ns BETWEEN 30000000 AND 37000000 THEN '33.3ms(2VSync)'
+            WHEN interval_ns BETWEEN 45000000 AND 55000000 THEN '50ms(3VSync)'
+            ELSE 'normal'
+          END AS pulldown_type,
+          CASE
+            WHEN interval_ns BETWEEN 30000000 AND 37000000 THEN 33333333
+            WHEN interval_ns BETWEEN 45000000 AND 55000000 THEN 50000000
+            WHEN interval_ns BETWEEN 15000000 AND 18000000 THEN 16666667
+            WHEN interval_ns BETWEEN 8000000 AND 9000000 THEN 8333333
+            ELSE interval_ns
+          END AS expected_ns
+        FROM filtered
+      )
+      SELECT
+        printf('%d', ts) AS ts,
+        interval_ms,
+        ROUND(expected_ns / 1e6, 2) AS expected_ms,
+        ROUND(ABS(interval_ns - expected_ns) / 1e6, 2) AS deviation_ms,
+        pulldown_type AS is_pulldown
+      FROM with_expected
+      WHERE pulldown_type != 'normal'
+      ORDER BY ts
+      LIMIT 200
+    save_as: pulldown_frames
+
+  # Step 3: 刷新率切换事件 + 期间丢帧
+  - id: mode_switch_events
+    type: atomic
+    name: "刷新率切换事件"
+    display:
+      level: detail
+      layer: list
+      title: "刷新率切换事件及丢帧"
+      columns:
+        - name: switch_ts
+          label: "切换时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: prev_rate
+          label: "切换前"
+          type: string
+        - name: new_rate
+          label: "切换后"
+          type: string
+        - name: gap_ms
+          label: "切换间隔(ms)"
+          type: number
+        - name: jank_during_switch
+          label: "期间丢帧"
+          type: number
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      vsync_intervals AS (
+        SELECT
+          interval.ts,
+          interval.dur AS interval_ns,
+          CASE
+            WHEN interval.dur < 8500000 THEN '120Hz'
+            WHEN interval.dur < 11500000 THEN '90Hz'
+            WHEN interval.dur < 17500000 THEN '60Hz'
+            WHEN interval.dur < 30000000 THEN '50Hz'
+            WHEN interval.dur < 38000000 THEN '30Hz'
+            WHEN interval.dur < 45000000 THEN '24Hz'
+            ELSE 'Other'
+          END AS rate_bucket
+        FROM counter_leading_intervals!((
+          SELECT c.*
+          FROM counter c
+          JOIN counter_track t ON c.track_id = t.id
+          WHERE (t.name GLOB '*VSYNC-sf*' OR t.name = 'VSYNC')
+        )) AS interval
+        WHERE interval.ts >= (SELECT start_ts FROM input)
+          AND interval.ts <= (SELECT end_ts FROM input)
+          AND interval.dur > 5500000
+          AND interval.dur < 50000000
+      ),
+      with_prev AS (
+        SELECT
+          ts,
+          interval_ns,
+          rate_bucket,
+          LAG(rate_bucket) OVER (ORDER BY ts) AS prev_rate,
+          LAG(ts) OVER (ORDER BY ts) AS prev_ts
+        FROM vsync_intervals
+      ),
+      switches AS (
+        SELECT
+          ts AS switch_ts,
+          prev_rate,
+          rate_bucket AS new_rate,
+          (ts - prev_ts) AS gap_ns
+        FROM with_prev
+        WHERE prev_rate IS NOT NULL AND rate_bucket != prev_rate
+      ),
+      -- 检查切换期间的 jank 帧
+      jank_check AS (
+        SELECT
+          s.ts,
+          1 AS is_jank
+        FROM actual_frame_timeline_slice s
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts AND s.ts < i.end_ts
+          AND s.jank_type != 'None'
+      )
+      SELECT
+        printf('%d', sw.switch_ts) AS switch_ts,
+        sw.prev_rate,
+        sw.new_rate,
+        ROUND(sw.gap_ns / 1e6, 2) AS gap_ms,
+        COALESCE(
+          (SELECT COUNT(*) FROM jank_check j
+           WHERE j.ts >= sw.switch_ts - 50000000 AND j.ts < sw.switch_ts + 200000000),
+          0
+        ) AS jank_during_switch
+      FROM switches sw
+      ORDER BY sw.switch_ts
+      LIMIT 50
+    save_as: mode_switch_events
+
+  # Step 4: VSync 间隔稳定性分析
+  - id: vsync_stability
+    type: atomic
+    name: "VSync 稳定性"
+    display:
+      level: summary
+      layer: overview
+      title: "VSync 间隔稳定性"
+      columns:
+        - name: rate_bucket
+          label: "刷新率档位"
+          type: string
+        - name: sample_count
+          label: "样本数"
+          type: number
+        - name: median_interval_ms
+          label: "中位间隔"
+          type: duration
+          format: duration_ms
+        - name: jitter_ms
+          label: "抖动(P90-P10)"
+          type: duration
+          format: duration_ms
+        - name: stability
+          label: "稳定性"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, MIN(ts)) AS start_ts,
+          COALESCE(${end_ts}, MAX(ts)) AS end_ts
+        FROM counter
+      ),
+      vsync_intervals AS (
+        SELECT
+          interval.dur AS interval_ns
+        FROM counter_leading_intervals!((
+          SELECT c.*
+          FROM counter c
+          JOIN counter_track t ON c.track_id = t.id
+          WHERE (t.name GLOB '*VSYNC-sf*' OR t.name = 'VSYNC')
+        )) AS interval
+        WHERE interval.ts >= (SELECT start_ts FROM input)
+          AND interval.ts <= (SELECT end_ts FROM input)
+      ),
+      filtered AS (
+        SELECT
+          interval_ns,
+          CASE
+            WHEN interval_ns < 8500000 THEN '120Hz'
+            WHEN interval_ns < 11500000 THEN '90Hz'
+            WHEN interval_ns < 17500000 THEN '60Hz'
+            WHEN interval_ns < 30000000 THEN '50Hz'
+            WHEN interval_ns < 38000000 THEN '30Hz'
+            WHEN interval_ns < 45000000 THEN '24Hz'
+            ELSE 'Other'
+          END AS rate_bucket
+        FROM vsync_intervals
+        WHERE interval_ns IS NOT NULL
+          AND interval_ns > 5500000
+          AND interval_ns < 50000000
+      )
+      SELECT
+        rate_bucket,
+        COUNT(*) AS sample_count,
+        ROUND(PERCENTILE(interval_ns, 0.5) / 1e6, 2) AS median_interval_ms,
+        ROUND((PERCENTILE(interval_ns, 0.9) - PERCENTILE(interval_ns, 0.1)) / 1e6, 2) AS jitter_ms,
+        CASE
+          WHEN (PERCENTILE(interval_ns, 0.9) - PERCENTILE(interval_ns, 0.1)) < 500000 THEN '稳定'
+          WHEN (PERCENTILE(interval_ns, 0.9) - PERCENTILE(interval_ns, 0.1)) < 2000000 THEN '轻微抖动'
+          ELSE '不稳定'
+        END AS stability
+      FROM filtered
+      GROUP BY rate_bucket
+      HAVING COUNT(*) >= 10
+      ORDER BY sample_count DESC
+    save_as: vsync_stability_result
+
+output:
+  format: structured
+  fields:
+    - name: refresh_content_match
+      description: "刷新率与内容帧率匹配状态"
+    - name: pulldown_frames
+      description: "3:2 Pulldown 抖动帧检测"
+    - name: mode_switch_events
+      description: "刷新率切换事件及丢帧"
+    - name: vsync_stability_result
+      description: "VSync 间隔稳定性分析"

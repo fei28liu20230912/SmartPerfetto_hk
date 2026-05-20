@@ -1,0 +1,383 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# DPad/遥控器按键输入响应延迟分析（原子 Skill）v1.0
+# =============================================================================
+# TV 场景专用：分析 DPad/遥控器按键从输入到画面焦点变化的完整延迟链路。
+# 区别于手机触控 (touch_to_display_latency / input_to_frame_latency)：
+# - TV 输入设备为 IR/BT/USB/CEC 遥控器，事件类型为 KEY 而非 MOTION
+# - 焦点移动 (focusSearch/requestFocus) 是 TV 输入响应的关键环节
+# - TV 上连续按键（长按 DPad）产生大量重复事件，需单独分析积压情况
+#
+# 数据源依赖：trace 需包含 input atrace category
+
+name: dpad_input_latency
+version: "1.0"
+type: atomic
+category: tv_input
+tier: A
+
+meta:
+  display_name: "TV 遥控器输入响应延迟"
+  description: "分析 DPad/遥控器按键输入到焦点变化画面更新的延迟，TV 场景专用"
+  icon: "tv_remote"
+  tags: [tv, dpad, remote, key, focus, input, latency, atomic]
+
+triggers:
+  keywords:
+    zh: [遥控器, DPad, 方向键, 焦点, 按键响应, TV输入, 遥控延迟, 焦点卡顿]
+    en: [dpad, remote, key input, focus change, tv input, remote latency, focus lag]
+  patterns:
+    - ".*(遥控|DPad|方向键|焦点).*(慢|卡|延迟|响应).*"
+    - ".*(dpad|remote|focus).*(slow|lag|latency|response).*"
+
+prerequisites:
+  required_tables:
+    - slice
+    - thread_track
+    - thread
+    - process
+  modules:
+    - slices.with_context
+
+inputs:
+  - name: package
+    type: string
+    required: false
+    description: "目标进程名（支持 GLOB）"
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+  - name: slow_threshold_ms
+    type: number
+    required: false
+    description: "慢响应阈值(ms)，默认 100（TV 按键响应要求比触控宽松）"
+
+steps:
+  # Step 1: KEY 事件分发延迟
+  - id: key_dispatch_latency
+    type: atomic
+    name: "按键分发延迟"
+    display:
+      level: detail
+      layer: list
+      title: "KEY 事件分发延迟"
+      columns:
+        - name: event_ts
+          label: "事件时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: process_name
+          label: "进程"
+          type: string
+        - name: slice_name
+          label: "Slice"
+          type: string
+        - name: dur_ms
+          label: "耗时"
+          type: duration
+          format: duration_ms
+        - name: thread_name
+          label: "线程"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(NULLIF('${package|}', ''), '') AS target_process,
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      key_slices AS (
+        SELECT
+          s.ts,
+          s.dur,
+          s.name AS slice_name,
+          COALESCE(t.name, '<unnamed>') AS thread_name,
+          p.name AS process_name,
+          ROUND(s.dur / 1e6, 2) AS dur_ms
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        JOIN process p ON t.upid = p.upid
+        CROSS JOIN input i
+        WHERE (i.target_process = '' OR p.name GLOB i.target_process || '*')
+          AND s.ts >= i.start_ts
+          AND s.ts < i.end_ts
+          AND s.dur > 0
+          AND (
+            s.name GLOB '*InputDispatcher*key*' OR
+            s.name GLOB '*dispatchKey*' OR
+            s.name GLOB '*deliverKeyEvent*' OR
+            s.name GLOB '*enqueueInputEvent*'
+          )
+      )
+      SELECT
+        printf('%d', ts) AS event_ts,
+        process_name,
+        slice_name,
+        dur_ms,
+        thread_name
+      FROM key_slices
+      ORDER BY ts
+      LIMIT 200
+    save_as: key_dispatch_events
+
+  # Step 2: 焦点系统活动分析
+  - id: focus_system_activity
+    type: atomic
+    name: "焦点系统活动"
+    display:
+      level: detail
+      layer: list
+      title: "焦点系统活动"
+      columns:
+        - name: ts
+          label: "时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_range
+          durationColumn: dur_ns
+        - name: dur_ns
+          label: "耗时(ns)"
+          type: duration
+          unit: ns
+          hidden: true
+        - name: dur_ms
+          label: "耗时"
+          type: duration
+          format: duration_ms
+        - name: slice_name
+          label: "Slice"
+          type: string
+        - name: process_name
+          label: "进程"
+          type: string
+        - name: thread_name
+          label: "线程"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(NULLIF('${package|}', ''), '') AS target_process,
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      focus_slices AS (
+        SELECT
+          s.ts,
+          s.dur,
+          s.name AS slice_name,
+          COALESCE(t.name, '<unnamed>') AS thread_name,
+          p.name AS process_name,
+          ROUND(s.dur / 1e6, 2) AS dur_ms
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        JOIN process p ON t.upid = p.upid
+        CROSS JOIN input i
+        WHERE (i.target_process = '' OR p.name GLOB i.target_process || '*')
+          AND s.ts >= i.start_ts
+          AND s.ts < i.end_ts
+          AND s.dur > 0
+          AND (
+            s.name GLOB '*focusSearch*' OR
+            s.name GLOB '*requestFocus*' OR
+            s.name GLOB '*onFocusChange*' OR
+            s.name GLOB '*clearFocus*' OR
+            s.name GLOB '*FocusTransition*' OR
+            s.name GLOB '*focusChange*'
+          )
+      )
+      SELECT
+        printf('%d', ts) AS ts,
+        printf('%d', dur) AS dur_ns,
+        dur_ms,
+        slice_name,
+        process_name,
+        thread_name
+      FROM focus_slices
+      ORDER BY dur DESC
+      LIMIT 100
+    save_as: focus_system_events
+
+  # Step 3: 焦点系统耗时统计
+  - id: focus_latency_summary
+    type: atomic
+    name: "焦点系统耗时统计"
+    display:
+      level: summary
+      layer: overview
+      title: "焦点系统耗时统计"
+      columns:
+        - name: category
+          label: "类别"
+          type: string
+        - name: count
+          label: "次数"
+          type: number
+          format: compact
+        - name: total_ms
+          label: "总耗时"
+          type: duration
+          format: duration_ms
+        - name: p95_ms
+          label: "P95"
+          type: duration
+          format: duration_ms
+        - name: max_ms
+          label: "最大"
+          type: duration
+          format: duration_ms
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(NULLIF('${package|}', ''), '') AS target_process,
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      focus_slices AS (
+        SELECT
+          s.dur,
+          CASE
+            WHEN s.name GLOB '*focusSearch*' THEN 'focusSearch'
+            WHEN s.name GLOB '*requestFocus*' THEN 'requestFocus'
+            WHEN s.name GLOB '*onFocusChange*' THEN 'onFocusChange'
+            WHEN s.name GLOB '*clearFocus*' THEN 'clearFocus'
+            WHEN s.name GLOB '*FocusTransition*' THEN 'FocusTransition'
+            ELSE 'other_focus'
+          END AS category,
+          ROUND(s.dur / 1e6, 2) AS dur_ms
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        JOIN process p ON t.upid = p.upid
+        CROSS JOIN input i
+        WHERE (i.target_process = '' OR p.name GLOB i.target_process || '*')
+          AND s.ts >= i.start_ts
+          AND s.ts < i.end_ts
+          AND s.dur > 0
+          AND (
+            s.name GLOB '*focusSearch*' OR
+            s.name GLOB '*requestFocus*' OR
+            s.name GLOB '*onFocusChange*' OR
+            s.name GLOB '*clearFocus*' OR
+            s.name GLOB '*FocusTransition*' OR
+            s.name GLOB '*focusChange*'
+          )
+      )
+      SELECT
+        category,
+        COUNT(*) AS count,
+        ROUND(SUM(dur_ms), 2) AS total_ms,
+        ROUND(PERCENTILE(dur_ms, 0.95), 2) AS p95_ms,
+        ROUND(MAX(dur_ms), 2) AS max_ms
+      FROM focus_slices
+      GROUP BY category
+      ORDER BY total_ms DESC
+    save_as: focus_latency_summary
+
+  # Step 4: 长按重复事件积压检测
+  - id: key_repeat_burst
+    type: atomic
+    name: "长按重复事件积压"
+    display:
+      level: summary
+      layer: overview
+      title: "长按重复事件积压检测"
+      columns:
+        - name: burst_start_ts
+          label: "积压开始"
+          type: timestamp
+          unit: ns
+        - name: event_count
+          label: "事件数"
+          type: number
+        - name: burst_duration_ms
+          label: "积压时长"
+          type: duration
+          format: duration_ms
+        - name: avg_interval_ms
+          label: "平均间隔"
+          type: duration
+          format: duration_ms
+        - name: process_name
+          label: "进程"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(NULLIF('${package|}', ''), '') AS target_process,
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      key_events AS (
+        SELECT
+          s.ts,
+          p.name AS process_name
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        JOIN process p ON t.upid = p.upid
+        CROSS JOIN input i
+        WHERE (i.target_process = '' OR p.name GLOB i.target_process || '*')
+          AND s.ts >= i.start_ts
+          AND s.ts < i.end_ts
+          AND (
+            s.name GLOB '*dispatchKey*' OR
+            s.name GLOB '*deliverKeyEvent*' OR
+            s.name GLOB '*InputDispatcher*key*'
+          )
+      ),
+      with_gap AS (
+        SELECT
+          ts,
+          process_name,
+          ts - LAG(ts) OVER (PARTITION BY process_name ORDER BY ts) AS gap_ns
+        FROM key_events
+      ),
+      -- 连续快速按键：间隔 < 100ms 视为同一 burst
+      burst_groups AS (
+        SELECT
+          ts,
+          process_name,
+          gap_ns,
+          SUM(CASE WHEN gap_ns > 100000000 OR gap_ns IS NULL THEN 1 ELSE 0 END)
+            OVER (PARTITION BY process_name ORDER BY ts) AS burst_id
+        FROM with_gap
+      )
+      SELECT
+        printf('%d', MIN(ts)) AS burst_start_ts,
+        COUNT(*) AS event_count,
+        ROUND((MAX(ts) - MIN(ts)) / 1e6, 2) AS burst_duration_ms,
+        ROUND(AVG(gap_ns) / 1e6, 2) AS avg_interval_ms,
+        process_name
+      FROM burst_groups
+      GROUP BY process_name, burst_id
+      HAVING COUNT(*) >= 5
+      ORDER BY event_count DESC
+      LIMIT 20
+    save_as: key_repeat_bursts
+
+output:
+  format: structured
+  fields:
+    - name: key_dispatch_events
+      description: "KEY 事件分发延迟详情"
+    - name: focus_system_events
+      description: "焦点系统活动详情"
+    - name: focus_latency_summary
+      description: "焦点系统耗时统计"
+    - name: key_repeat_bursts
+      description: "长按重复事件积压检测"

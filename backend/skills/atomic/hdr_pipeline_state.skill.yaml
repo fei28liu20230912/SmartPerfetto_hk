@@ -1,0 +1,381 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# HDR/Dolby Vision 管线状态检测（原子 Skill）v1.0
+# =============================================================================
+# TV 场景专用：检测 HDR/Dolby Vision 管线状态，包括：
+# - 当前 HDR 模式（HDR10/HDR10+/Dolby Vision/HLG/SDR）
+# - Tone mapping 活动（HDR→SDR 转换开销）
+# - 色彩空间切换事件
+# - HDR 对 HWC 合成路径的影响
+#
+# 数据源依赖：trace 需包含 gfx + video atrace category
+
+name: hdr_pipeline_state
+version: "1.0"
+type: atomic
+category: tv_display
+tier: A
+
+meta:
+  display_name: "HDR/DV 管线状态"
+  description: "检测 HDR/Dolby Vision 管线状态、Tone Mapping 活动和色彩空间切换"
+  icon: "high_quality"
+  tags: [tv, hdr, dolby_vision, tone_mapping, color_space, atomic]
+
+triggers:
+  keywords:
+    zh: [HDR, Dolby Vision, 杜比视界, 色彩空间, Tone Mapping, 亮度, HDR卡顿, HDR切换]
+    en: [hdr, dolby vision, tone mapping, color space, pq, hlg, hdr10]
+  patterns:
+    - ".*(HDR|Dolby|杜比|色彩空间|ToneMapping).*(卡顿|切换|延迟|问题).*"
+    - ".*(hdr|dolby|tone.?mapping|color.?space).*(jank|switch|latency|issue).*"
+
+prerequisites:
+  required_tables:
+    - slice
+    - counter
+    - counter_track
+    - thread_track
+    - thread
+    - process
+
+inputs:
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+
+steps:
+  # Step 1: HDR 模式检测
+  - id: hdr_mode_detection
+    type: atomic
+    name: "HDR 模式检测"
+    display:
+      level: summary
+      layer: overview
+      title: "HDR 模式状态"
+      columns:
+        - name: hdr_type
+          label: "HDR 类型"
+          type: string
+        - name: signal_count
+          label: "信号次数"
+          type: number
+        - name: first_ts_ms
+          label: "首次出现(ms)"
+          type: number
+        - name: last_ts_ms
+          label: "最后出现(ms)"
+          type: number
+        - name: source
+          label: "来源"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      -- 从 slice 检测 HDR 信号
+      hdr_slices AS (
+        SELECT
+          s.ts,
+          CASE
+            WHEN s.name GLOB '*DolbyVision*' OR s.name GLOB '*dolby*vision*' OR s.name GLOB '*DV*' THEN 'DolbyVision'
+            WHEN s.name GLOB '*HDR10+*' OR s.name GLOB '*hdr10plus*' THEN 'HDR10+'
+            WHEN s.name GLOB '*HDR10*' OR s.name GLOB '*hdr10*' THEN 'HDR10'
+            WHEN s.name GLOB '*HLG*' OR s.name GLOB '*hlg*' THEN 'HLG'
+            WHEN s.name GLOB '*PQ*' OR s.name GLOB '*ST2084*' THEN 'HDR_PQ'
+            ELSE 'HDR_UNKNOWN'
+          END AS hdr_type,
+          'slice' AS source
+        FROM slice s
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts AND s.ts < i.end_ts
+          AND (
+            s.name GLOB '*HDR*' OR s.name GLOB '*hdr*' OR
+            s.name GLOB '*DolbyVision*' OR s.name GLOB '*dolby*vision*' OR
+            s.name GLOB '*DV*' OR s.name GLOB '*HLG*' OR
+            s.name GLOB '*PQ*' OR s.name GLOB '*ST2084*' OR
+            s.name GLOB '*HDR10*'
+          )
+      ),
+      -- 从 counter 检测色彩空间信号
+      color_counters AS (
+        SELECT
+          c.ts,
+          CASE
+            WHEN t.name GLOB '*HDR*' OR t.name GLOB '*hdr*' THEN 'HDR_Counter'
+            WHEN t.name GLOB '*ColorMode*' OR t.name GLOB '*colorMode*' THEN 'ColorMode'
+            WHEN t.name GLOB '*PQ*' THEN 'HDR_PQ_Counter'
+            ELSE 'HDR_Counter_Unknown'
+          END AS hdr_type,
+          'counter' AS source
+        FROM counter c
+        JOIN counter_track t ON c.track_id = t.id
+        CROSS JOIN input i
+        WHERE c.ts >= i.start_ts AND c.ts < i.end_ts
+          AND (
+            t.name GLOB '*HDR*' OR t.name GLOB '*hdr*' OR
+            t.name GLOB '*ColorMode*' OR t.name GLOB '*colorMode*' OR
+            t.name GLOB '*PQ*' OR t.name GLOB '*DV*'
+          )
+      ),
+      all_signals AS (
+        SELECT hdr_type, ts, source FROM hdr_slices
+        UNION ALL
+        SELECT hdr_type, ts, source FROM color_counters
+      )
+      SELECT
+        hdr_type,
+        COUNT(*) AS signal_count,
+        ROUND(MIN(ts) / 1e6, 2) AS first_ts_ms,
+        ROUND(MAX(ts) / 1e6, 2) AS last_ts_ms,
+        source
+      FROM all_signals
+      GROUP BY hdr_type, source
+      ORDER BY signal_count DESC
+    save_as: hdr_mode_status
+
+  # Step 2: Tone Mapping 活动
+  - id: tone_mapping_activity
+    type: atomic
+    name: "Tone Mapping 活动"
+    display:
+      level: detail
+      layer: list
+      title: "Tone Mapping 操作"
+      columns:
+        - name: ts
+          label: "时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_range
+          durationColumn: dur_ns
+        - name: dur_ns
+          label: "耗时(ns)"
+          type: duration
+          unit: ns
+          hidden: true
+        - name: dur_ms
+          label: "耗时"
+          type: duration
+          format: duration_ms
+        - name: slice_name
+          label: "Slice"
+          type: string
+        - name: process_name
+          label: "进程"
+          type: string
+        - name: thread_name
+          label: "线程"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      tone_map_slices AS (
+        SELECT
+          s.ts,
+          s.dur,
+          s.name AS slice_name,
+          COALESCE(t.name, '<unnamed>') AS thread_name,
+          p.name AS process_name,
+          ROUND(s.dur / 1e6, 2) AS dur_ms
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        LEFT JOIN process p ON t.upid = p.upid
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts AND s.ts < i.end_ts
+          AND s.dur > 0
+          AND (
+            s.name GLOB '*toneMap*' OR s.name GLOB '*ToneMap*' OR
+            s.name GLOB '*tone_mapping*' OR s.name GLOB '*ToneMapping*' OR
+            s.name GLOB '*HDR*convert*' OR s.name GLOB '*hdr*convert*' OR
+            s.name GLOB '*colorSpace*' OR s.name GLOB '*ColorSpace*'
+          )
+      )
+      SELECT
+        printf('%d', ts) AS ts,
+        printf('%d', dur) AS dur_ns,
+        dur_ms,
+        slice_name,
+        process_name,
+        thread_name
+      FROM tone_map_slices
+      ORDER BY dur DESC
+      LIMIT 100
+    save_as: tone_mapping_events
+
+  # Step 3: 色彩空间切换事件
+  - id: color_space_switches
+    type: atomic
+    name: "色彩空间切换"
+    display:
+      level: detail
+      layer: list
+      title: "色彩空间/显示模式切换"
+      columns:
+        - name: switch_ts
+          label: "切换时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: track_name
+          label: "Track"
+          type: string
+        - name: prev_value
+          label: "切换前"
+          type: string
+        - name: new_value
+          label: "切换后"
+          type: string
+        - name: gap_ms
+          label: "间隔(ms)"
+          type: number
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      color_data AS (
+        SELECT
+          c.ts,
+          c.value,
+          t.name AS track_name
+        FROM counter c
+        JOIN counter_track t ON c.track_id = t.id
+        CROSS JOIN input i
+        WHERE c.ts >= i.start_ts AND c.ts < i.end_ts
+          AND (
+            t.name GLOB '*ColorMode*' OR
+            t.name GLOB '*colorMode*' OR
+            t.name GLOB '*DisplayMode*' OR
+            t.name GLOB '*displayMode*' OR
+            t.name GLOB '*HDR*' OR
+            t.name GLOB '*hdr*'
+          )
+      ),
+      with_prev AS (
+        SELECT
+          ts,
+          value,
+          track_name,
+          LAG(value) OVER (PARTITION BY track_name ORDER BY ts) AS prev_value,
+          LAG(ts) OVER (PARTITION BY track_name ORDER BY ts) AS prev_ts
+        FROM color_data
+      )
+      SELECT
+        printf('%d', ts) AS switch_ts,
+        track_name,
+        CAST(prev_value AS TEXT) AS prev_value,
+        CAST(value AS TEXT) AS new_value,
+        ROUND((ts - prev_ts) / 1e6, 2) AS gap_ms
+      FROM with_prev
+      WHERE prev_value IS NOT NULL AND value != prev_value
+      ORDER BY ts
+      LIMIT 50
+    save_as: color_space_switch_events
+
+  # Step 4: HDR 期间 SurfaceFlinger 合成路径变化
+  - id: hdr_sf_composition_impact
+    type: atomic
+    name: "HDR 对 SF 合成的影响"
+    display:
+      level: summary
+      layer: overview
+      title: "HDR 期间 SF 合成路径"
+      columns:
+        - name: period
+          label: "时段"
+          type: string
+        - name: avg_sf_dur_ms
+          label: "平均SF耗时"
+          type: duration
+          format: duration_ms
+        - name: client_comp_count
+          label: "Client合成次数"
+          type: number
+        - name: overlay_count
+          label: "Overlay次数"
+          type: number
+        - name: total_frames
+          label: "总帧数"
+          type: number
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+        ),
+      sf_frames AS (
+        SELECT
+          s.ts,
+          s.dur,
+          CASE
+            WHEN s.name GLOB '*clientComposition*' OR s.name GLOB '*client composition*' THEN 'client'
+            ELSE 'other'
+          END AS comp_type,
+          ROUND(s.dur / 1e6, 2) AS dur_ms
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        CROSS JOIN input i
+        WHERE t.name = 'SurfaceFlinger'
+          AND s.ts >= i.start_ts AND s.ts < i.end_ts
+          AND s.dur > 0
+      ),
+      -- 检查是否有 HDR 信号将时间段分为 HDR 和 SDR
+      hdr_signal AS (
+        SELECT 1 AS has_hdr FROM slice
+        CROSS JOIN input i
+        WHERE ts >= i.start_ts AND ts < i.end_ts
+          AND (name GLOB '*HDR*' OR name GLOB '*DolbyVision*')
+        LIMIT 1
+      ),
+      frame_stats AS (
+        SELECT
+          CASE
+            WHEN (SELECT has_hdr FROM hdr_signal) = 1 THEN 'HDR期间'
+            ELSE 'SDR期间'
+          END AS period,
+          dur_ms,
+          comp_type
+        FROM sf_frames
+      )
+      SELECT
+        period,
+        ROUND(AVG(dur_ms), 2) AS avg_sf_dur_ms,
+        SUM(CASE WHEN comp_type = 'client' THEN 1 ELSE 0 END) AS client_comp_count,
+        SUM(CASE WHEN comp_type != 'client' THEN 1 ELSE 0 END) AS overlay_count,
+        COUNT(*) AS total_frames
+      FROM frame_stats
+      GROUP BY period
+    save_as: hdr_sf_impact
+
+output:
+  format: structured
+  fields:
+    - name: hdr_mode_status
+      description: "HDR 模式检测状态"
+    - name: tone_mapping_events
+      description: "Tone Mapping 操作详情"
+    - name: color_space_switch_events
+      description: "色彩空间切换事件"
+    - name: hdr_sf_impact
+      description: "HDR 对 SF 合成的影响"
