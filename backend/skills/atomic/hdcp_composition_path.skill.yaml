@@ -283,3 +283,13 @@ output:
       description: "Secure/DRM Buffer 活动"
     - name: drm_composition_path
       description: "DRM 内容期间 HWC 合成路径对比"
+
+output_contract:
+  primary_view: drm_composition_path
+  related_views:
+    - hdcp_auth_events
+    - secure_buffer_events
+  interpretation: |
+    HDCP 受保护内容必须走 HWC overlay (device_overlay)，降级到 client composition 意味着合成路径异常。
+    HDCP 认证失败会导致内容播放黑屏，认证时间通常 <500ms。
+    Secure Buffer 活动异常可能表示 DRM 解密路径有问题。

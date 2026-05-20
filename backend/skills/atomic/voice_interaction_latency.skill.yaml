@@ -1,0 +1,482 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# TV 近/远场语音交互延迟分析（原子 Skill）v1.0
+# =============================================================================
+# TV 场景专用：分析近场语音（遥控器麦克风）和远场语音（TV 麦克风阵列）
+# 从触发到识别结果执行的完整延迟链路。
+# - 近场：语音键按下 → VoiceInteractionSession → 录音 → ASR → 执行
+# - 远场：唤醒词检测 → AEC/Beamforming → ASR → 执行
+# 区别于手机：TV 远场需要 AEC（回声消除），TV 大音量播放时 AEC 是瓶颈
+#
+# 数据源依赖：trace 需包含 audio + input atrace category；远场需 hal:audio
+
+name: voice_interaction_latency
+version: "1.0"
+type: atomic
+category: tv_input
+tier: A
+
+meta:
+  display_name: "TV 语音交互延迟（近场/远场）"
+  description: "分析 TV 近场（遥控器麦克风）和远场（TV 麦克风阵列）语音交互的延迟链路"
+  icon: "mic"
+  tags: [tv, voice, near-field, far-field, hotword, asr, assistant, latency, atomic]
+
+triggers:
+  keywords:
+    zh: [语音, 语音助手, 语音交互, 近场语音, 远场语音, 小V, 唤醒词, Hey Google, 语音识别, 语音延迟, 语音响应慢, 语音键]
+    en: [voice, voice assistant, voice interaction, near-field, far-field, hotword, wake word, asr, assistant, voice latency, hey google]
+  patterns:
+    - ".*(语音|voice|assistant).*(慢|卡|延迟|响应|识别|交互).*"
+    - ".*(唤醒|hotword|wake).*(词|word|检测|延迟|慢).*"
+    - ".*(远场|近场).*(语音|麦克风|拾音).*"
+    - ".*(语音键|voice key|voice button).*(响应|延迟|慢).*"
+
+prerequisites:
+  required_tables:
+    - slice
+    - thread_track
+    - thread
+    - process
+  modules:
+    - slices.with_context
+  recommended_atrace:
+    - audio
+    - input
+    - am
+  optional_atrace:
+    - hal:audio
+    - view
+    - network
+
+inputs:
+  - name: mode
+    type: string
+    required: false
+    description: "分析模式：near-field（近场）、far-field（远场）、all（全部），默认 all"
+  - name: package
+    type: string
+    required: false
+    description: "目标进程名（支持 GLOB），默认空（分析所有）"
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+  - name: slow_threshold_ms
+    type: number
+    required: false
+    description: "慢响应阈值(ms)，近场默认 800ms，远场默认 1500ms"
+
+steps:
+  # Step 1: 语音交互 Session 生命周期
+  - id: voice_session_lifecycle
+    type: atomic
+    name: "语音交互 Session 生命周期"
+    display:
+      level: overview
+      layer: list
+      title: "VoiceInteractionSession 生命周期"
+      columns:
+        - name: ts
+          label: "时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_range
+          durationColumn: dur_ns
+        - name: dur_ns
+          label: "耗时(ns)"
+          type: duration
+          unit: ns
+          hidden: true
+        - name: dur_ms
+          label: "耗时"
+          type: duration
+          format: duration_ms
+        - name: slice_name
+          label: "阶段"
+          type: string
+        - name: process_name
+          label: "进程"
+          type: string
+        - name: thread_name
+          label: "线程"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(NULLIF('${package|}', ''), '') AS target_process,
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      voice_slices AS (
+        SELECT
+          s.ts,
+          s.dur,
+          s.name AS slice_name,
+          COALESCE(t.name, '<unnamed>') AS thread_name,
+          p.name AS process_name,
+          ROUND(s.dur / 1e6, 2) AS dur_ms
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        JOIN process p ON t.upid = p.upid
+        CROSS JOIN input i
+        WHERE (i.target_process = '' OR p.name GLOB i.target_process || '*')
+          AND s.ts >= i.start_ts
+          AND s.ts < i.end_ts
+          AND s.dur > 0
+          AND (
+            s.name GLOB '*VoiceInteraction*' OR
+            s.name GLOB '*VoiceInteractionSession*' OR
+            s.name GLOB '*VoiceInteractionService*' OR
+            s.name GLOB '*HotwordDetector*' OR
+            s.name GLOB '*VoiceTrigger*' OR
+            s.name GLOB '*AssistantSession*' OR
+            p.name GLOB '*vizzini*' OR
+            p.name GLOB '*katniss*' OR
+            p.name GLOB '*walleve*' OR
+            t.name GLOB '*cae_front*' OR
+            t.name GLOB '*cae_back*'
+          )
+      )
+      SELECT
+        printf('%d', ts) AS ts,
+        printf('%d', dur) AS dur_ns,
+        dur_ms,
+        slice_name,
+        process_name,
+        thread_name
+      FROM voice_slices
+      ORDER BY ts
+      LIMIT 300
+    save_as: voice_session_events
+
+  # Step 2: 语音键触发事件（近场专用）
+  - id: voice_key_trigger
+    type: atomic
+    name: "语音键触发事件"
+    display:
+      level: detail
+      layer: list
+      title: "语音键触发（近场）"
+      columns:
+        - name: event_ts
+          label: "事件时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: slice_name
+          label: "Slice"
+          type: string
+        - name: dur_ms
+          label: "分发耗时"
+          type: duration
+          format: duration_ms
+        - name: process_name
+          label: "进程"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      voice_key_slices AS (
+        SELECT
+          s.ts,
+          s.dur,
+          s.name AS slice_name,
+          p.name AS process_name,
+          ROUND(s.dur / 1e6, 2) AS dur_ms
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        JOIN process p ON t.upid = p.upid
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts
+          AND s.ts < i.end_ts
+          AND s.dur > 0
+          AND (
+            s.name GLOB '*InputDispatcher*key*' OR
+            s.name GLOB '*dispatchKey*'
+          )
+          AND (
+            s.name GLOB '*VOICE*' OR
+            s.name GLOB '*ASSIST*' OR
+            s.name GLOB '*SEARCH*' OR
+            s.name GLOB '*voice*' OR
+            s.name GLOB '*assist*'
+          )
+      )
+      SELECT
+        printf('%d', ts) AS event_ts,
+        slice_name,
+        dur_ms,
+        process_name
+      FROM voice_key_slices
+      ORDER BY ts
+      LIMIT 100
+    save_as: voice_key_events
+
+  # Step 3: AudioFlinger 输入流活动（录音阶段）
+  - id: audio_input_stream
+    type: atomic
+    name: "AudioFlinger 录音流活动"
+    display:
+      level: detail
+      layer: list
+      title: "AudioFlinger 录音输入流"
+      columns:
+        - name: ts
+          label: "时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_range
+          durationColumn: dur_ns
+        - name: dur_ns
+          label: "耗时(ns)"
+          type: duration
+          unit: ns
+          hidden: true
+        - name: dur_ms
+          label: "耗时"
+          type: duration
+          format: duration_ms
+        - name: slice_name
+          label: "Slice"
+          type: string
+        - name: thread_name
+          label: "线程"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      audio_input_slices AS (
+        SELECT
+          s.ts,
+          s.dur,
+          s.name AS slice_name,
+          COALESCE(t.name, '<unnamed>') AS thread_name,
+          ROUND(s.dur / 1e6, 2) AS dur_ms
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts
+          AND s.ts < i.end_ts
+          AND s.dur > 0
+          AND (
+            s.name GLOB '*AudioFlinger*input*' OR
+            s.name GLOB '*AudioFlinger*Input*' OR
+            s.name GLOB '*AudioRecord*' OR
+            s.name GLOB '*audio*hal*input*' OR
+            s.name GLOB '*AEC*' OR
+            s.name GLOB '*aec*' OR
+            s.name GLOB '*beamform*' OR
+            s.name GLOB '*Beamform*'
+          )
+      )
+      SELECT
+        printf('%d', ts) AS ts,
+        printf('%d', dur) AS dur_ns,
+        dur_ms,
+        slice_name,
+        thread_name
+      FROM audio_input_slices
+      ORDER BY ts
+      LIMIT 200
+    save_as: audio_input_events
+
+  # Step 4: 唤醒词检测事件（远场专用）
+  - id: hotword_detection
+    type: atomic
+    name: "唤醒词检测事件"
+    display:
+      level: detail
+      layer: list
+      title: "唤醒词检测（远场）"
+      columns:
+        - name: ts
+          label: "时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: slice_name
+          label: "检测阶段"
+          type: string
+        - name: dur_ms
+          label: "耗时"
+          type: duration
+          format: duration_ms
+        - name: process_name
+          label: "进程"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      hotword_slices AS (
+        SELECT
+          s.ts,
+          s.dur,
+          s.name AS slice_name,
+          COALESCE(p.name, '<no-process>') AS process_name,
+          ROUND(s.dur / 1e6, 2) AS dur_ms
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        LEFT JOIN process p ON t.upid = p.upid
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts
+          AND s.ts < i.end_ts
+          AND s.dur > 0
+          AND (
+            s.name GLOB '*HotwordDetector*' OR
+            s.name GLOB '*hotword*' OR
+            s.name GLOB '*VoiceTrigger*' OR
+            s.name GLOB '*voice_trigger*' OR
+            s.name GLOB '*keyword*' OR
+            s.name GLOB '*KeywordDetector*' OR
+            s.name GLOB '*SoundTrigger*' OR
+            s.name GLOB '*sound_trigger*'
+          )
+      )
+      SELECT
+        printf('%d', ts) AS ts,
+        slice_name,
+        dur_ms,
+        process_name
+      FROM hotword_slices
+      ORDER BY ts
+      LIMIT 100
+    save_as: hotword_events
+
+  # Step 5: 语音交互延迟汇总
+  - id: voice_latency_summary
+    type: atomic
+    name: "语音交互延迟汇总"
+    display:
+      level: overview
+      layer: summary
+      title: "语音交互延迟统计"
+      columns:
+        - name: phase
+          label: "阶段"
+          type: string
+        - name: count
+          label: "次数"
+          type: number
+        - name: avg_ms
+          label: "平均耗时"
+          type: duration
+          format: duration_ms
+        - name: p50_ms
+          label: "P50"
+          type: duration
+          format: duration_ms
+        - name: p95_ms
+          label: "P95"
+          type: duration
+          format: duration_ms
+        - name: max_ms
+          label: "最大耗时"
+          type: duration
+          format: duration_ms
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      voice_all AS (
+        SELECT
+          CASE
+            WHEN s.name GLOB '*HotwordDetector*' OR s.name GLOB '*VoiceTrigger*' OR s.name GLOB '*SoundTrigger*' OR s.name GLOB '*keyword*' THEN 'wake_detection'
+            WHEN t.name GLOB '*cae_front*' THEN 'xmf_asr_front'
+            WHEN t.name GLOB '*cae_back*' THEN 'xmf_asr_back'
+            WHEN s.name GLOB '*VoiceInteractionSession*show*' OR s.name GLOB '*VoiceInteractionService*show*' OR s.name GLOB '*AssistantSession*show*' THEN 'session_create'
+            WHEN s.name GLOB '*AudioFlinger*input*' OR s.name GLOB '*AudioRecord*' OR s.name GLOB '*audio*hal*input*' THEN 'audio_recording'
+            WHEN s.name GLOB '*AEC*' OR s.name GLOB '*aec*' OR s.name GLOB '*beamform*' THEN 'aec_processing'
+            WHEN s.name GLOB '*InputDispatcher*key*VOICE*' OR s.name GLOB '*InputDispatcher*key*ASSIST*' OR s.name GLOB '*dispatchKey*VOICE*' THEN 'voice_key_dispatch'
+            ELSE 'other_voice_interaction'
+          END AS phase,
+          ROUND(s.dur / 1e6, 2) AS dur_ms
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts
+          AND s.ts < i.end_ts
+          AND s.dur > 0
+          AND (
+            s.name GLOB '*VoiceInteraction*' OR
+            s.name GLOB '*HotwordDetector*' OR
+            s.name GLOB '*VoiceTrigger*' OR
+            s.name GLOB '*SoundTrigger*' OR
+            s.name GLOB '*AudioFlinger*input*' OR
+            s.name GLOB '*AudioRecord*' OR
+            s.name GLOB '*AEC*' OR
+            s.name GLOB '*aec*' OR
+            s.name GLOB '*beamform*' OR
+            s.name GLOB '*keyword*' OR
+            s.name GLOB '*AssistantSession*' OR
+            s.name GLOB '*vizzini*' OR
+            s.name GLOB '*katniss*' OR
+            s.name GLOB '*walleve*' OR
+            t.name GLOB '*cae_front*' OR
+            t.name GLOB '*cae_back*'
+          )
+      )
+      SELECT
+        phase,
+        COUNT(*) AS count,
+        ROUND(AVG(dur_ms), 1) AS avg_ms,
+        ROUND(PERCENTILE(dur_ms, 50), 1) AS p50_ms,
+        ROUND(PERCENTILE(dur_ms, 95), 1) AS p95_ms,
+        ROUND(MAX(dur_ms), 1) AS max_ms
+      FROM voice_all
+      WHERE phase != 'other_voice_interaction'
+      GROUP BY phase
+      ORDER BY avg_ms DESC
+    save_as: voice_latency_stats
+
+output_contract:
+  primary_view: voice_latency_stats
+  related_views:
+    - voice_session_events
+    - voice_key_events
+    - audio_input_events
+    - hotword_events
+  interpretation: |
+    近场语音延迟正常范围：
+    - 语音键分发：<30ms
+    - Session 创建：50-200ms
+    - 录音启动：30-100ms
+    - 本地 ASR：100-500ms
+    - 云端 ASR：500-2000ms（受网络影响）
+
+    远场语音延迟正常范围：
+    - 唤醒词检测：<500ms
+    - AEC 处理：30-200ms（大音量时偏上限）
+    - 录音启动：50-150ms
+    - 本地 ASR：100-500ms
+    - 云端 ASR：500-2000ms
+
+    如果 P95 超出正常范围 2 倍以上，应进一步分析阻塞原因。

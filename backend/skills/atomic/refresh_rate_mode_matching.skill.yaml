@@ -456,3 +456,16 @@ output:
       description: "刷新率切换事件及丢帧"
     - name: vsync_stability_result
       description: "VSync 间隔稳定性分析"
+
+output_contract:
+  primary_view: vsync_stability_result
+  related_views:
+    - refresh_content_match
+    - pulldown_frames
+    - mode_switch_events
+  interpretation: |
+    TV 刷新率匹配关键指标：
+    - 24fps 内容应在 24/48/120Hz 显示，60Hz 显示会产生 3:2 pulldown
+    - Pulldown 抖动帧占比 >5% 用户可感知
+    - 刷新率切换期间丢帧 <3 帧为正常
+    - VSync 间隔标准差 >0.5ms 表示不稳定

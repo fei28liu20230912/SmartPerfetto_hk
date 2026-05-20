@@ -379,3 +379,16 @@ output:
       description: "色彩空间切换事件"
     - name: hdr_sf_impact
       description: "HDR 对 SF 合成的影响"
+
+output_contract:
+  primary_view: hdr_sf_impact
+  related_views:
+    - hdr_mode_status
+    - tone_mapping_events
+    - color_space_switch_events
+  interpretation: |
+    HDR 模式对渲染管线的影响：
+    - Tone Mapping 通常由 GPU 执行，开销 2-8ms/帧
+    - HDR 内容通常强制 HWC overlay
+    - 色彩空间切换期间可能有短暂黑屏
+    - HDR 模式下 GPU fill rate 压力增大，4K HDR 需特别关注

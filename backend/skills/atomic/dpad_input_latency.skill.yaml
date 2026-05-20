@@ -381,3 +381,17 @@ output:
       description: "焦点系统耗时统计"
     - name: key_repeat_bursts
       description: "长按重复事件积压检测"
+
+output_contract:
+  primary_view: focus_latency_summary
+  related_views:
+    - key_dispatch_events
+    - focus_system_events
+    - key_repeat_bursts
+  interpretation: |
+    TV 遥控器按键延迟正常范围：
+    - KEY 分发：<30ms
+    - 焦点搜索：<50ms
+    - 整体按键到画面：<100ms（TV 比手机触控阈值宽松）
+    如 P95 > 100ms 应检查焦点搜索复杂度和 InputDispatcher 队列积压。
+    长按重复事件间隔正常 50-100ms，积压超过 5 个事件应告警。

@@ -38,6 +38,24 @@ keywords:
   - 焦点卡顿
   - 音频延迟
   - lipsync
+  - 语音
+  - 语音助手
+  - 语音交互
+  - 近场语音
+  - 远场语音
+  - 唤醒词
+  - 语音识别
+  - 语音延迟
+  - hotword
+  - voice
+  - 低内存
+  - 内存不足
+  - 内存压力
+  - OOM
+  - LMK
+  - 内存水位
+  - IO压力
+  - 线程优先级
 compound_patterns:
   - "(遥控|DPad|方向键|焦点).*(慢|卡|延迟|响应)"
   - "(音画|声画|音视频|A/V).*(同步|不同步|偏差|延迟)"
@@ -45,6 +63,11 @@ compound_patterns:
   - "(HDCP|DRM|受保护).*(播放|合成|降级)"
   - "(刷新率|帧率).*(匹配|切换|抖动)"
   - "(TV|电视|leanback).*(启动|卡顿|性能)"
+  - "(语音|voice|assistant).*(慢|卡|延迟|响应|识别|交互)"
+  - "(唤醒|hotword|wake).*(词|word|检测|延迟|慢)"
+  - "(远场|近场).*(语音|麦克风|拾音)"
+  - "(内存|memory).*(不足|压力|优化|OOM|LMK|水位)"
+  - "(IO|io).*(压力|卡顿|调度)"
 
 phase_hints:
   - id: tv_input_response
@@ -73,10 +96,15 @@ phase_hints:
     critical_tools: ['refresh_rate_mode_matching', 'vrr_detection']
     critical: true
   - id: tv_long_run_stability
-    keywords: ['长时间', '稳定性', '内存泄漏', '温控', '降频', '长时间运行']
-    constraints: 'TV 常开数小时，内存泄漏和温控降频问题比手机更突出。需要检查长时间趋势而非单次快照。'
-    critical_tools: ['memory_analysis', 'cpu_cluster_mapping_view', 'thermal_throttling']
-    critical: false
+    keywords: ['长时间', '稳定性', '内存泄漏', '温控', '降频', '长时间运行', '低内存', '内存不足', 'OOM', 'LMK', '内存压力', 'IO压力', '线程优先级', '调度']
+    constraints: 'TV 常开数小时，内存泄漏和温控降频问题比手机更突出。1GB/1.5GB 低内存设备必须跑 low_memory_optimization 做综合诊断。需要 memory + sched + io atrace category。'
+    critical_tools: ['low_memory_optimization', 'memory_analysis', 'cpu_cluster_mapping_view', 'thermal_throttling']
+    critical: true
+  - id: tv_voice_interaction
+    keywords: ['语音', '语音助手', '语音交互', '近场', '远场', '唤醒词', 'hotword', 'voice', 'ASR', '语音识别', '语音延迟', '语音响应']
+    constraints: 'TV 语音交互分近场（遥控器麦克风）和远场（TV 麦克风阵列），延迟链路完全不同。远场需要 AEC 回声消除，TV 大音量播放时 AEC 是瓶颈。需要 audio atrace category，远场还需 hal:audio。'
+    critical_tools: ['voice_interaction_latency']
+    critical: true
 
 plan_template:
   mandatory_aspects:
@@ -139,11 +167,27 @@ IF 刷新率/帧率匹配:
   → 如发现切换丢帧 → 检查 DisplayMode 切换延迟
   → 关联 → invoke_skill("vrr_detection")
 
+IF 语音交互/语音助手:
+  invoke_skill("voice_interaction_latency")
+  → 近场（遥控器语音键）→ 检查 Session 创建延迟 + ASR RTT
+  → 远场（唤醒词）→ 检查唤醒检测延迟 + AEC 处理耗时
+  → 如发现 AudioFlinger input 延迟大 → 检查录音线程优先级
+  → 如发现云端 ASR 慢 → 检查网络延迟（network 事件）
+  → 如发现 AEC 耗时大 → 检查 TV 播放音量 + CPU 调度
+
 IF TV 启动/卡顿:
   → 按通用场景路由，但注意 TV 特点：
     - Leanback Launcher 的启动链路
     - TV SoC 通常比手机弱，CPU/GPU 预算更紧
     - 4K 分辨率下 GPU fill rate 压力
+
+IF 低内存/OOM/LMK/IO压力/调度问题:
+  invoke_skill("low_memory_optimization")
+  → 自动输出：常驻内存审计 + direct reclaim 检测 + LMK 统计 + IO 阻塞 + 关键线程调度延迟
+  → 如发现 direct reclaim → 调整内存水位线，审计常驻进程
+  → 如发现 IO 阻塞 → 切换 IO 调度器，后台 IO 限流
+  → 如发现 SF/Audio 调度延迟 → 调整线程优先级，检查 CPU cgroup
+  → lookup_knowledge("tv-low-memory") 获取详细调优参数
 ```
 
 **Phase 2 — TV 通用补充检查：**
@@ -166,6 +210,10 @@ IF TV 启动/卡顿:
 | Netflix 黑屏 | HDCP 认证失败 | hdcp_composition_path → hdcp_auth_status |
 | 电影画面抖动 | 3:2 pulldown | refresh_rate_mode_matching → pulldown_detection |
 | 切频道黑屏 | 刷新率切换延迟 | refresh_rate_mode_matching → mode_switch_events |
+| 语音响应慢 | Session 创建延迟 / ASR RTT / AEC 处理 | voice_interaction_latency → voice_session_events |
+| 远场唤醒延迟 | 唤醒检测慢 / AEC 瓶颈 | voice_interaction_latency → hotword_events + audio_input_events |
+| 低内存卡顿 | Direct Reclaim / LMK 频繁 / IO 阻塞 | low_memory_optimization → optimization_summary |
+| 关键线程被抢占 | 优先级配置不当 / 后台抢占大核 | low_memory_optimization → critical_thread_stats |
 | 长时间播放变卡 | 内存泄漏/温控 | memory_analysis + thermal_throttling |
 
 **知识模板注入：**
@@ -174,3 +222,5 @@ IF TV 启动/卡顿:
 - `knowledge-tv-input-chain.template.md` — TV 输入链路知识
 - `knowledge-tv-display-modes.template.md` — TV 显示模式/刷新率/HDR/HDCP 知识
 - `knowledge-tv-av-sync.template.md` — 音视频同步知识
+- `knowledge-tv-voice-interaction.template.md` — 近/远场语音交互知识
+- `knowledge-tv-low-memory.template.md` — 低内存设备优化知识（常驻内存/IO调度/水位线/CPU调度/线程优先级）

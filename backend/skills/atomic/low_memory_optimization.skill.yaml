@@ -1,0 +1,525 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+# This file is part of SmartPerfetto. See LICENSE for details.
+
+# =============================================================================
+# TV 低内存设备性能诊断（原子 Skill）v1.0
+# =============================================================================
+# 针对 MT9221(1GB/1.5GB)、RT2875P(1.5GB) 等低内存 TV 设备的综合诊断。
+# 覆盖：常驻内存审计、IO 压力、内存水位/LMK、CPU 调度、关键线程优先级。
+#
+# 数据源依赖：trace 需包含 memory、sched、io atrace category
+
+name: low_memory_optimization
+version: "1.0"
+type: atomic
+category: tv_system
+tier: A
+
+meta:
+  display_name: "TV 低内存设备性能诊断"
+  description: "针对 1GB/1.5GB 低内存 TV 设备的综合性能诊断，输出内存/IO/CPU/调度优化建议"
+  icon: "memory"
+  tags: [tv, low-memory, lmk, io, cpu, scheduler, optimization, atomic]
+
+triggers:
+  keywords:
+    zh: [低内存, 内存不足, 内存压力, OOM, LMK, 卡顿, 内存优化, 常驻内存, 内存水位, IO压力, 调度优化, 线程优先级]
+    en: [low memory, oom, lmk, memory pressure, memory optimization, io pressure, scheduler, thread priority]
+  patterns:
+    - '.*(内存|memory).*(不足|压力|优化|泄漏|OOM|LMK|水位|低).*'
+    - '.*(1GB|1\.5GB|低内存|入门).*(卡顿|优化|性能).*'
+    - '.*(IO|io).*(压力|卡顿|慢|调度).*'
+    - '.*(线程|调度|优先级).*(优化|调整|抢占).*'
+
+prerequisites:
+  required_tables:
+    - slice
+    - thread_track
+    - thread
+    - process
+    - counter
+  modules:
+    - slices.with_context
+  recommended_atrace:
+    - memory
+    - sched
+    - io
+    - input
+    - audio
+  optional_atrace:
+    - power
+    - view
+
+inputs:
+  - name: target_memory_mb
+    type: number
+    required: false
+    description: "目标设备内存大小(MB)，默认 1024 (1GB)。用于计算水位线建议。"
+  - name: start_ts
+    type: timestamp
+    required: false
+    description: "分析起始时间戳(ns)"
+  - name: end_ts
+    type: timestamp
+    required: false
+    description: "分析结束时间戳(ns)"
+
+steps:
+  # Step 1: 内存全景 — 各进程内存占用排行
+  - id: memory_footprint_ranking
+    type: atomic
+    name: "进程内存占用排行"
+    display:
+      level: overview
+      layer: summary
+      title: "进程内存占用 Top 20"
+      columns:
+        - name: process_name
+          label: "进程"
+          type: string
+        - name: rss_mb
+          label: "RSS(MB)"
+          type: number
+        - name: oom_adj
+          label: "OOM Adj"
+          type: number
+        - name: category
+          label: "类别"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts,
+          COALESCE(${target_memory_mb}, 1024) AS total_memory_mb
+      ),
+      process_memory AS (
+        SELECT
+          p.name AS process_name,
+          COALESCE(p.upid, 0) AS upid,
+          AVG(c.value) / 1024 / 1024 AS rss_mb
+        FROM counter c
+        JOIN process_counter_track pct ON c.track_id = pct.id
+        JOIN process p ON pct.upid = p.upid
+        CROSS JOIN input i
+        WHERE c.ts >= i.start_ts AND c.ts < i.end_ts
+          AND (c.name GLOB '*rss*' OR c.name GLOB '*RSS*' OR c.name GLOB '*mem.*')
+        GROUP BY p.name
+      ),
+      adj_info AS (
+        SELECT
+          p.name AS process_name,
+          CAST(s.value AS INT) AS oom_adj
+        FROM counter s
+        JOIN process_counter_track pct ON s.track_id = pct.id
+        JOIN process p ON pct.upid = p.upid
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts AND s.ts < i.end_ts
+          AND s.name GLOB '*oom_adj*'
+        GROUP BY p.name
+        HAVING s.ts = MAX(s.ts)
+      )
+      SELECT
+        pm.process_name,
+        ROUND(COALESCE(pm.rss_mb, 0), 1) AS rss_mb,
+        COALESCE(a.oom_adj, -1) AS oom_adj,
+        CASE
+          WHEN pm.process_name GLOB '*system_server*' THEN 'system'
+          WHEN pm.process_name GLOB '*launcher*' OR pm.process_name GLOB '*Launcher*' OR pm.process_name GLOB '*Leanback*' THEN 'launcher'
+          WHEN pm.process_name GLOB '*systemui*' OR pm.process_name GLOB '*SystemUI*' THEN 'systemui'
+          WHEN pm.process_name GLOB '*walleve*' OR pm.process_name GLOB '*katniss*' OR pm.process_name GLOB '*vizzini*' THEN 'voice'
+          WHEN pm.process_name GLOB '*cast*' OR pm.process_name GLOB '*Cast*' THEN 'cast'
+          WHEN pm.process_name GLOB '*gms*' OR pm.process_name GLOB '*google*' THEN 'gms'
+          WHEN pm.process_name GLOB '*surfaceflinger*' THEN 'hal'
+          ELSE 'app'
+        END AS category
+      FROM process_memory pm
+      LEFT JOIN adj_info a ON pm.process_name = a.process_name
+      ORDER BY pm.rss_mb DESC
+      LIMIT 20
+    save_as: memory_ranking
+
+  # Step 2: Direct Reclaim 事件检测
+  - id: direct_reclaim_detection
+    type: atomic
+    name: "Direct Reclaim 事件检测"
+    display:
+      level: detail
+      layer: list
+      title: "Direct Reclaim 事件（内存严重不足信号）"
+      columns:
+        - name: ts
+          label: "时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: dur_ms
+          label: "耗时(ms)"
+          type: duration
+          format: duration_ms
+        - name: thread_name
+          label: "触发线程"
+          type: string
+        - name: process_name
+          label: "进程"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      )
+      SELECT
+        printf('%d', s.ts) AS ts,
+        ROUND(s.dur / 1e6, 2) AS dur_ms,
+        COALESCE(t.name, '<unnamed>') AS thread_name,
+        COALESCE(p.name, '<kernel>') AS process_name
+      FROM slice s
+      JOIN thread_track tt ON s.track_id = tt.id
+      JOIN thread t ON tt.utid = t.utid
+      LEFT JOIN process p ON t.upid = p.upid
+      CROSS JOIN input i
+      WHERE s.ts >= i.start_ts AND s.ts < i.end_ts
+        AND s.dur > 0
+        AND (
+          s.name GLOB '*direct reclaim*' OR
+          s.name GLOB '*direct_reclaim*' OR
+          s.name GLOB '*kswapd*' OR
+          s.name GLOB '*compaction*' OR
+          s.name GLOB '*vmscan*'
+        )
+      ORDER BY s.dur DESC
+      LIMIT 100
+    save_as: reclaim_events
+
+  # Step 3: LMK 事件统计
+  - id: lmk_event_stats
+    type: atomic
+    name: "LMK 事件统计"
+    display:
+      level: overview
+      layer: summary
+      title: "LMK 杀进程统计"
+      columns:
+        - name: process_name
+          label: "被杀进程"
+          type: string
+        - name: kill_count
+          label: "被杀次数"
+          type: number
+        - name: oom_adj
+          label: "OOM Adj"
+          type: number
+        - name: avg_rss_mb
+          label: "平均RSS(MB)"
+          type: number
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      lmk_slices AS (
+        SELECT
+          s.ts,
+          COALESCE(p.name, s.name) AS process_name,
+          s.name AS slice_name
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        LEFT JOIN process p ON t.upid = p.upid
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts AND s.ts < i.end_ts
+          AND (
+            s.name GLOB '*lmk*' OR
+            s.name GLOB '*kill*process*' OR
+            s.name GLOB '*oom_kill*' OR
+            s.name GLOB '*lowmemorykiller*'
+          )
+      )
+      SELECT
+        process_name,
+        COUNT(*) AS kill_count,
+        -1 AS oom_adj,
+        -1 AS avg_rss_mb
+      FROM lmk_slices
+      GROUP BY process_name
+      ORDER BY kill_count DESC
+      LIMIT 20
+    save_as: lmk_stats
+
+  # Step 4: IO 阻塞与延迟分析
+  - id: io_blocking_analysis
+    type: atomic
+    name: "IO 阻塞分析"
+    display:
+      level: detail
+      layer: list
+      title: "IO 阻塞 Top 事件"
+      columns:
+        - name: ts
+          label: "时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_timeline
+        - name: dur_ms
+          label: "阻塞时长(ms)"
+          type: duration
+          format: duration_ms
+        - name: thread_name
+          label: "线程"
+          type: string
+        - name: process_name
+          label: "进程"
+          type: string
+        - name: slice_name
+          label: "类型"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      io_slices AS (
+        SELECT
+          s.ts,
+          s.dur,
+          s.name AS slice_name,
+          COALESCE(t.name, '<unnamed>') AS thread_name,
+          COALESCE(p.name, '<no-process>') AS process_name,
+          ROUND(s.dur / 1e6, 2) AS dur_ms
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        LEFT JOIN process p ON t.upid = p.upid
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts AND s.ts < i.end_ts
+          AND s.dur > 1000000
+          AND (
+            s.name GLOB '*block*rq*' OR
+            s.name GLOB '*io_wait*' OR
+            s.name GLOB '*f2fs*' OR
+            s.name GLOB '*ext4*' OR
+            s.name GLOB '*writeback*' OR
+            s.name GLOB '*D state*' OR
+            s.name GLOB '*iowait*'
+          )
+      )
+      SELECT
+        printf('%d', ts) AS ts,
+        dur_ms,
+        thread_name,
+        process_name,
+        slice_name
+      FROM io_slices
+      ORDER BY dur_ms DESC
+      LIMIT 100
+    save_as: io_blocking_events
+
+  # Step 5: 关键线程调度延迟
+  - id: critical_thread_scheduling
+    type: atomic
+    name: "关键线程调度延迟"
+    display:
+      level: detail
+      layer: list
+      title: "关键线程调度延迟"
+      columns:
+        - name: thread_name
+          label: "线程"
+          type: string
+        - name: process_name
+          label: "进程"
+          type: string
+        - name: wait_count
+          label: "等待次数"
+          type: number
+        - name: avg_wait_ms
+          label: "平均等待(ms)"
+          type: duration
+          format: duration_ms
+        - name: max_wait_ms
+          label: "最大等待(ms)"
+          type: duration
+          format: duration_ms
+        - name: priority
+          label: "重要性"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts
+      ),
+      critical_threads AS (
+        SELECT
+          s.ts, s.dur,
+          t.name AS thread_name,
+          COALESCE(p.name, '<no-process>') AS process_name
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        LEFT JOIN process p ON t.upid = p.upid
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts AND s.ts < i.end_ts
+          AND s.dur > 1000000
+          AND (
+            t.name GLOB '*surfaceflinger*' OR
+            t.name GLOB '*SurfaceFlinger*' OR
+            t.name GLOB '*AudioFlinger*' OR
+            t.name GLOB '*RenderThread*' OR
+            t.name GLOB '*InputDispatcher*' OR
+            t.name GLOB '*InputReader*' OR
+            t.name GLOB '*cae_front*' OR
+            t.name GLOB '*cae_back*' OR
+            t.name GLOB '*katniss*' OR
+            t.name GLOB '*walleve*' OR
+            t.name GLOB '*vizzini*' OR
+            t.name GLOB '*hwui*' OR
+            t.name GLOB '*HWUI*'
+          )
+      )
+      SELECT
+        thread_name,
+        process_name,
+        COUNT(*) AS wait_count,
+        ROUND(AVG(dur) / 1e6, 2) AS avg_wait_ms,
+        ROUND(MAX(dur) / 1e6, 2) AS max_wait_ms,
+        CASE
+          WHEN thread_name GLOB '*SurfaceFlinger*' THEN 'P0-critical'
+          WHEN thread_name GLOB '*AudioFlinger*' THEN 'P0-critical'
+          WHEN thread_name GLOB '*RenderThread*' THEN 'P1-high'
+          WHEN thread_name GLOB '*Input*' THEN 'P1-high'
+          WHEN thread_name GLOB '*cae_*' THEN 'P1-high'
+          ELSE 'P2-normal'
+        END AS priority
+      FROM critical_threads
+      GROUP BY thread_name, process_name
+      ORDER BY avg_wait_ms DESC
+      LIMIT 30
+    save_as: critical_thread_stats
+
+  # Step 6: 低内存优化综合建议
+  - id: low_memory_optimization_summary
+    type: atomic
+    name: "低内存优化综合建议"
+    display:
+      level: overview
+      layer: summary
+      title: "低内存设备优化建议"
+      columns:
+        - name: module
+          label: "优化模块"
+          type: string
+        - name: issue
+          label: "发现的问题"
+          type: string
+        - name: severity
+          label: "严重程度"
+          type: string
+        - name: suggestion
+          label: "优化建议"
+          type: string
+    sql: |
+      WITH
+      input AS (
+        SELECT
+          COALESCE(${start_ts}, 0) AS start_ts,
+          COALESCE(${end_ts}, (SELECT COALESCE(MAX(ts + dur), 0) FROM slice)) AS end_ts,
+          COALESCE(${target_memory_mb}, 1024) AS total_memory_mb
+      ),
+      -- 统计各类事件数量
+      reclaim_count AS (
+        SELECT COUNT(*) AS cnt FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts AND s.ts < i.end_ts
+          AND s.name GLOB '*direct reclaim*'
+      ),
+      io_slow_count AS (
+        SELECT COUNT(*) AS cnt FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts AND s.ts < i.end_ts
+          AND s.dur > 10000000
+          AND (s.name GLOB '*block*rq*' OR s.name GLOB '*io_wait*' OR s.name GLOB '*writeback*')
+      ),
+      sf_delay AS (
+        SELECT ROUND(AVG(s.dur) / 1e6, 2) AS avg_ms FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts AND s.ts < i.end_ts
+          AND s.dur > 1000000
+          AND t.name GLOB '*SurfaceFlinger*'
+      ),
+      audio_delay AS (
+        SELECT ROUND(AVG(s.dur) / 1e6, 2) AS avg_ms FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        CROSS JOIN input i
+        WHERE s.ts >= i.start_ts AND s.ts < i.end_ts
+          AND s.dur > 1000000
+          AND t.name GLOB '*AudioFlinger*'
+      )
+      SELECT '内存' AS module,
+        'Direct Reclaim 次数: ' || COALESCE((SELECT cnt FROM reclaim_count), 0) AS issue,
+        CASE WHEN COALESCE((SELECT cnt FROM reclaim_count), 0) > 10 THEN 'P0-严重'
+             WHEN COALESCE((SELECT cnt FROM reclaim_count), 0) > 0 THEN 'P1-警告'
+             ELSE 'OK' END AS severity,
+        CASE WHEN COALESCE((SELECT cnt FROM reclaim_count), 0) > 0
+          THEN '调整 min_free_kbytes 提高水位线；审计常驻进程减少内存占用；考虑冻结非必要后台服务'
+          ELSE '内存水位正常' END AS suggestion
+      UNION ALL
+      SELECT 'IO', 'IO阻塞(>10ms)次数: ' || COALESCE((SELECT cnt FROM io_slow_count), 0),
+        CASE WHEN COALESCE((SELECT cnt FROM io_slow_count), 0) > 50 THEN 'P0-严重'
+             WHEN COALESCE((SELECT cnt FROM io_slow_count), 0) > 10 THEN 'P1-警告'
+             ELSE 'OK' END,
+        CASE WHEN COALESCE((SELECT cnt FROM io_slow_count), 0) > 10
+          THEN '切换IO调度器为bfq；后台IO限流(ionice/cgroup)；减少前台同步写'
+          ELSE 'IO压力正常' END
+      UNION ALL
+      SELECT 'CPU调度-SF', 'SurfaceFlinger平均调度延迟: ' || COALESCE((SELECT avg_ms FROM sf_delay), 0) || 'ms',
+        CASE WHEN COALESCE((SELECT avg_ms FROM sf_delay), 0) > 10 THEN 'P0-严重'
+             WHEN COALESCE((SELECT avg_ms FROM sf_delay), 0) > 3 THEN 'P1-警告'
+             ELSE 'OK' END,
+        CASE WHEN COALESCE((SELECT avg_ms FROM sf_delay), 0) > 3
+          THEN 'SF主线程设SCHED_FIFO优先级-4；后台进程绑小核；检查是否有后台任务抢占大核'
+          ELSE 'SF调度正常' END
+      UNION ALL
+      SELECT 'CPU调度-Audio', 'AudioFlinger平均调度延迟: ' || COALESCE((SELECT avg_ms FROM audio_delay), 0) || 'ms',
+        CASE WHEN COALESCE((SELECT avg_ms FROM audio_delay), 0) > 5 THEN 'P0-严重'
+             WHEN COALESCE((SELECT avg_ms FROM audio_delay), 0) > 2 THEN 'P1-警告'
+             ELSE 'OK' END,
+        CASE WHEN COALESCE((SELECT avg_ms FROM audio_delay), 0) > 2
+          THEN 'AudioFlinger设SCHED_FIFO优先级-2；检查audio线程是否被IO阻塞(direct reclaim)'
+          ELSE 'Audio调度正常' END
+      ORDER BY module
+    save_as: optimization_summary
+
+output_contract:
+  primary_view: optimization_summary
+  related_views:
+    - memory_ranking
+    - reclaim_events
+    - lmk_stats
+    - io_blocking_events
+    - critical_thread_stats
+  interpretation: |
+    低内存设备优化建议优先级：
+    P0-严重: 必须修复，直接影响用户体验
+    P1-警告: 建议修复，影响特定场景体验
+    OK: 该模块正常
+
+    关键优化路径：
+    1. 内存：水位线调整 → 常驻进程审计 → LMK 策略优化
+    2. IO：调度器选择 → 后台限流 → 减少同步写
+    3. CPU：关键线程 FIFO → 后台绑小核 → DVFS 调优
+    4. 线程优先级：SF/Audio → RenderThread/Input → 语音算法 → 后台最低

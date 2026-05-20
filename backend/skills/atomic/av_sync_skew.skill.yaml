@@ -367,6 +367,7 @@ steps:
       SELECT '样本数', CAST(COUNT(*) AS REAL) FROM paired
       UNION ALL
       SELECT '超阈值次数', CAST(SUM(CASE WHEN ABS(skew_ms) > (SELECT skew_threshold_ms FROM input) THEN 1 ELSE 0 END) AS REAL) FROM paired
+    save_as: av_skew_summary
 
 output:
   format: structured
@@ -379,3 +380,14 @@ output:
       description: "A/V Sync 偏差事件详情"
     - name: av_skew_summary
       description: "A/V Sync 偏差统计"
+
+output_contract:
+  primary_view: av_skew_summary
+  related_views:
+    - audio_underrun_status
+    - video_release_timing
+    - av_skew_events
+  interpretation: |
+    A/V Sync 偏差正常范围：<15ms（用户不可感知），15-45ms（轻微偏差），>45ms（明显不同步）。
+    AudioFlinger underrun 是音频侧偏差的常见原因，视频侧偏差多为解码延迟或 releaseOutputBuffer 时机异常。
+    如 P90 > 45ms 应进一步分析阻塞原因。
