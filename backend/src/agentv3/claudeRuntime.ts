@@ -7,6 +7,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 import type { TraceProcessorService } from '../services/traceProcessorService';
+import { getTraceMetadataPath } from '../services/traceMetadataStore';
 import { createSkillExecutor } from '../services/skillEngine/skillExecutor';
 import { ensureSkillRegistryInitialized, skillRegistry } from '../services/skillEngine/skillLoader';
 import { getSkillAnalysisAdapter } from '../services/skillEngine/skillAnalysisAdapter';
@@ -2895,6 +2896,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       traceOs: traceInfo?.traceOs,
       traceFormat: traceInfo?.traceFormat,
       outputLanguage: this.config.outputLanguage,
+      deviceProfile: this.loadDeviceProfileForTrace(traceId),
     };
     const systemPrompt = buildSystemPrompt(analysisContextForRebuild);
 
@@ -2915,6 +2917,23 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       analysisContextForRebuild, // Used by correction retry to rebuild prompt with reduced budget
       sessionMapKey, // Composite key for comparison mode session identity isolation
     };
+  }
+
+  /** Load device profile from trace metadata (if a bugreport was attached). */
+  private loadDeviceProfileForTrace(traceId: string): string | undefined {
+    try {
+      // Synchronous read — traceMetadataStore caches metadata in the JSON file
+      const metadataPath = getTraceMetadataPath(traceId);
+      if (!metadataPath) return undefined;
+      // Use require for synchronous JSON load (trace metadata is small)
+      const fs = require('fs');
+      if (!fs.existsSync(metadataPath)) return undefined;
+      const raw = fs.readFileSync(metadataPath, 'utf8');
+      const parsed = JSON.parse(raw);
+      return parsed?.deviceProfile || undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private estimateConfidence(findings: Finding[]): number {

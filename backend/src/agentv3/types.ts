@@ -103,8 +103,10 @@ export interface ClaudeAnalysisContext {
   traceOs?: 'android' | 'harmonyos' | 'unknown';
   /** Detected trace format */
   traceFormat?: 'perfetto_protobuf' | 'systrace_text' | 'atrace_text' | 'unknown';
-  /** User-facing output language for answers, reports, and insight text. */
-  outputLanguage?: OutputLanguage;
+ /** User-facing output language for answers, reports, and insight text. */
+ outputLanguage?: OutputLanguage;
+  /** Device profile extracted from bugreport — SoC, memory, OS variant, etc. */
+  deviceProfile?: string;
 }
 
 // =============================================================================

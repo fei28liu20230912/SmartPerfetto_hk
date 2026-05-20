@@ -357,6 +357,11 @@ export function buildSystemPromptParts(
     if (completenessSection) push(2, 'trace_completeness', completenessSection, true);
   }
 
+  // ── Device profile from bugreport ──
+  if (context.deviceProfile) {
+    push(2, 'device_profile', context.deviceProfile, true);
+  }
+
   // ── HarmonyOS context injection ──
   if (context.traceOs === 'harmonyos') {
     const harmonyRendering = loadPromptTemplate('knowledge-harmonyos-rendering');

@@ -32,8 +32,9 @@ export interface TraceMetadata extends ResourceOwnerFields {
   status: string;
   path?: string;
   port?: number;
-  externalRpc?: boolean;
-  expiresAt?: number;
+ externalRpc?: boolean;
+ expiresAt?: number;
+  deviceProfile?: string;
 }
 
 interface TraceAssetRow extends Record<string, unknown> {
@@ -137,9 +138,10 @@ function metadataJsonForRow(metadata: TraceMetadata): string {
   return JSON.stringify({
     filename: metadata.filename,
     uploadedAt: metadata.uploadedAt,
-    ...(typeof metadata.port === 'number' ? { port: metadata.port } : {}),
-    ...(metadata.externalRpc ? { externalRpc: true } : {}),
-  });
+   ...(typeof metadata.port === 'number' ? { port: metadata.port } : {}),
+   ...(metadata.externalRpc ? { externalRpc: true } : {}),
+    ...(metadata.deviceProfile ? { deviceProfile: metadata.deviceProfile } : {}),
+ });
 }
 
 function rowToTraceMetadata(row: TraceAssetRow): TraceMetadata {
@@ -164,9 +166,10 @@ function rowToTraceMetadata(row: TraceAssetRow): TraceMetadata {
     workspaceId: row.workspace_id,
     ...(row.owner_user_id ? { userId: row.owner_user_id } : {}),
     ...(typeof port === 'number' ? { port } : {}),
-    ...(externalRpc ? { externalRpc: true } : {}),
-    ...(typeof row.expires_at === 'number' ? { expiresAt: row.expires_at } : {}),
-  };
+   ...(externalRpc ? { externalRpc: true } : {}),
+   ...(typeof row.expires_at === 'number' ? { expiresAt: row.expires_at } : {}),
+    ...(typeof extra.deviceProfile === 'string' ? { deviceProfile: extra.deviceProfile } : {}),
+ };
 }
 
 function isTraceAssetRowLive(row: TraceAssetRow, now = Date.now()): boolean {

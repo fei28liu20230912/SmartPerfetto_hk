@@ -224,3 +224,4 @@ IF 低内存/OOM/LMK/IO压力/调度问题:
 - `knowledge-tv-av-sync.template.md` — 音视频同步知识
 - `knowledge-tv-voice-interaction.template.md` — 近/远场语音交互知识
 - `knowledge-tv-low-memory.template.md` — 低内存设备优化知识（常驻内存/IO调度/水位线/CPU调度/线程优先级）
+- `knowledge-tv-tcl-hardware.template.md` — TCL TV 硬件平台配置（SoC/内存/OS变体/设备识别/配置敏感诊断策略）

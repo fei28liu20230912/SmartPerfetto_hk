@@ -41,16 +41,18 @@ import {
   sendTenantMutationDeniedPayload,
 } from '../services/enterpriseTenantLifecycleService';
 import {
-  buildTraceOwnerMetadata,
-  deleteTraceMetadataForContext,
-  getTraceFilePath,
-  getWritableTraceDirForContext,
-  listTraceMetadataForContext,
-  readTraceMetadata,
-  readTraceMetadataForContext,
-  type TraceMetadata,
-  writeTraceMetadata,
+ buildTraceOwnerMetadata,
+ deleteTraceMetadataForContext,
+ getTraceFilePath,
+ getWritableTraceDirForContext,
+ listTraceMetadataForContext,
+ readTraceMetadata,
+ readTraceMetadataForContext,
+ type TraceMetadata,
+ writeTraceMetadata,
+ isSafeTraceId,
 } from '../services/traceMetadataStore';
+import { parseBugreportFile, formatDeviceProfileForPrompt } from '../services/bugreportParser';
 import { isPrivilegedRequestContext, sendResourceNotFound } from '../services/resourceOwnership';
 import {
   canDeleteTraceResource,
@@ -782,6 +784,71 @@ router.post(
       res.status(500).json({
         error: 'Upload failed',
         details: error.message
+      });
+    }
+  },
+);
+
+// POST /api/traces/:traceId/bugreport - Attach a bugreport to an existing trace
+router.post(
+  '/:traceId/bugreport',
+  requireTracePermission('trace:write', 'Attaching bugreport requires trace:write permission'),
+  upload.single('file'),
+  async (req, res) => {
+    try {
+      const { traceId } = req.params as { traceId: string };
+      if (!isSafeTraceId(traceId)) {
+        return res.status(400).json({ error: 'Invalid trace ID' });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({ error: 'No bugreport file uploaded' });
+      }
+
+      const bugreportPath = req.file.path;
+      console.log(`[bugreport] Parsing bugreport for trace ${traceId}: ${req.file.originalname}`);
+
+      // Parse the bugreport
+      const profile = await parseBugreportFile(bugreportPath);
+      const profileText = formatDeviceProfileForPrompt(profile);
+
+      // Clean up the uploaded bugreport file
+      await cleanupFile(bugreportPath);
+
+      // Read existing trace metadata and add deviceProfile
+      const metadata = await readTraceMetadata(traceId);
+      if (!metadata) {
+        return res.status(404).json({ error: 'Trace not found' });
+      }
+
+      metadata.deviceProfile = profileText;
+      await writeTraceMetadata(metadata);
+
+      console.log(`[bugreport] Device profile saved for trace ${traceId}: ${profile.socPlatform || 'unknown'} / ${profile.memoryTotalMb || '?'}MB / ${profile.osVariant}`);
+
+      res.json({
+        success: true,
+        traceId,
+        deviceProfile: {
+          model: profile.model,
+          brand: profile.brand,
+          socPlatform: profile.socPlatform,
+          socVendor: profile.socVendor,
+          memoryTotalMb: profile.memoryTotalMb,
+          memoryTier: profile.memoryTier,
+          osVariant: profile.osVariant,
+          androidVersion: profile.androidVersion,
+          cpuCoreCount: profile.cpuCoreCount,
+          gpuDriver: profile.gpuDriver,
+          voiceAssistant: profile.voiceAssistant,
+        },
+      });
+    } catch (error: any) {
+      await cleanupFile(req.file?.path);
+      console.error('[bugreport] Parse error:', error);
+      res.status(500).json({
+        error: 'Failed to parse bugreport',
+        details: error.message,
       });
     }
   },
