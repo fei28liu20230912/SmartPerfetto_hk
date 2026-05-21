@@ -53,6 +53,11 @@ const PROBLEM_THRESHOLDS: Record<string, SceneThreshold> = {
   navigation: { durationMs: 500 },
   anr: { durationMs: 5000 },
   window_transition: { durationMs: 500 },
+  tv_ac_on_boot: { durationMs: 20000 },
+  tv_str_boot: { durationMs: 5000 },
+  tv_voice_wakeup_near: { durationMs: 1000 },
+  tv_voice_wakeup_far: { durationMs: 1500 },
+  tv_half_screen_launch: { durationMs: 1000 },
 };
 
 const SCENE_DISPLAY_NAMES: Record<string, string> = {
@@ -83,6 +88,18 @@ const SCENE_DISPLAY_NAMES: Record<string, string> = {
   ime_show: '键盘弹出',
   ime_hide: '键盘收起',
   window_transition: '窗口转场',
+  // TV scenes
+  tv_ac_on_boot: 'AC_ON开机',
+  tv_str_boot: 'STR开机',
+  tv_voice_wakeup_near: '近场语音唤醒',
+  tv_voice_wakeup_far: '远场语音唤醒',
+  tv_4k60_media_playback: '4K60Hz媒体播放',
+  tv_local_media_playback: '本地媒体播放',
+  tv_streaming_playback: '流媒体播放',
+  tv_half_screen_launch: '半屏应用启动',
+  tv_half_screen_dashboard: '半屏Dashboard',
+  tv_half_screen_quickpanel: '半屏QuickPanel',
+  tv_half_screen_systemui: '半屏系统面板',
 };
 
 /** Known launcher / home-screen package patterns */
@@ -192,6 +209,26 @@ export function buildDisplayedScenes(envelopes: DataEnvelope[]): BuildDisplayedS
       }
     } else if (stepId === 'jank_events') {
       jankRowsForFallback.push(...rows);
+    } else if (stepId === 'tv_boot_events') {
+      for (const row of rows) {
+        const scene = sceneFromTvBootEvent(row, scenes.length);
+        if (scene) scenes.push(scene);
+      }
+    } else if (stepId === 'tv_voice_interaction') {
+      for (const row of rows) {
+        const scene = sceneFromTvVoiceInteraction(row, scenes.length);
+        if (scene) scenes.push(scene);
+      }
+    } else if (stepId === 'tv_media_playback') {
+      for (const row of rows) {
+        const scene = sceneFromTvMediaPlayback(row, scenes.length);
+        if (scene) scenes.push(scene);
+      }
+    } else if (stepId === 'tv_half_screen_launch') {
+      for (const row of rows) {
+        const scene = sceneFromTvHalfScreenLaunch(row, scenes.length);
+        if (scene) scenes.push(scene);
+      }
     }
   }
 
@@ -830,4 +867,122 @@ function resolveProcessName(row: Record<string, any>): string {
   const m = eventText.match(/\[([^\]]+)\]\s*$/);
   if (m) return m[1];
   return 'unknown';
+}
+
+// ---------------------------------------------------------------------------
+// TV scene factories
+// ---------------------------------------------------------------------------
+
+function sceneFromTvBootEvent(row: Record<string, any>, index: number): DisplayedScene | null {
+  const startTs = String(row.ts ?? '');
+  const dur = String(row.dur ?? '0');
+  const endTs = safeAddNs(startTs, dur) ?? startTs;
+  if (!startTs) return null;
+  const durationMs = nsToMs(dur);
+  const safeDurationMs = Number.isFinite(durationMs) ? durationMs : 0;
+
+  const bootType = String(row.boot_type ?? '').trim();
+  if (bootType !== 'tv_ac_on_boot' && bootType !== 'tv_str_boot') return null;
+
+  return {
+    id: `tv_boot_events-${index}`,
+    sceneType: bootType,
+    sourceStepId: 'tv_boot_events',
+    startTs,
+    endTs,
+    durationMs: safeDurationMs,
+    processName: 'system',
+    label: `${displayNameOf(bootType)} (${formatDuration(safeDurationMs)})`,
+    metadata: { bootType },
+    severity: severityFor(bootType, safeDurationMs),
+    analysisState: 'not_planned',
+  };
+}
+
+function sceneFromTvVoiceInteraction(row: Record<string, any>, index: number): DisplayedScene | null {
+  const startTs = String(row.ts ?? '');
+  const dur = String(row.dur ?? '0');
+  const endTs = safeAddNs(startTs, dur) ?? startTs;
+  if (!startTs) return null;
+  const durationMs = nsToMs(dur);
+  const safeDurationMs = Number.isFinite(durationMs) ? durationMs : 0;
+
+  const voiceType = String(row.voice_type ?? '').trim();
+  if (voiceType !== 'tv_voice_wakeup_near' && voiceType !== 'tv_voice_wakeup_far') return null;
+
+  return {
+    id: `tv_voice_interaction-${index}`,
+    sceneType: voiceType,
+    sourceStepId: 'tv_voice_interaction',
+    startTs,
+    endTs,
+    durationMs: safeDurationMs,
+    processName: 'system',
+    label: `${displayNameOf(voiceType)} (${formatDuration(safeDurationMs)})`,
+    metadata: { voiceType },
+    severity: severityFor(voiceType, safeDurationMs),
+    analysisState: 'not_planned',
+  };
+}
+
+function sceneFromTvMediaPlayback(row: Record<string, any>, index: number): DisplayedScene | null {
+  const startTs = String(row.ts ?? '');
+  const dur = String(row.dur ?? '0');
+  const endTs = safeAddNs(startTs, dur) ?? startTs;
+  if (!startTs) return null;
+  const durationMs = nsToMs(dur);
+  const safeDurationMs = Number.isFinite(durationMs) ? durationMs : 0;
+
+  const mediaType = String(row.media_type ?? '').trim();
+  if (mediaType !== 'tv_4k60_media_playback' && mediaType !== 'tv_local_media_playback' && mediaType !== 'tv_streaming_playback') return null;
+
+  const appDisplayName = String(row.app_display_name ?? '').trim();
+  const baseLabel = displayNameOf(mediaType);
+  const label = appDisplayName
+    ? `${appDisplayName} ${baseLabel} (${formatDuration(safeDurationMs)})`
+    : `${baseLabel} (${formatDuration(safeDurationMs)})`;
+
+  return {
+    id: `tv_media_playback-${index}`,
+    sceneType: mediaType,
+    sourceStepId: 'tv_media_playback',
+    startTs,
+    endTs,
+    durationMs: safeDurationMs,
+    processName: resolveProcessName(row),
+    label,
+    metadata: {
+      resolution: row.resolution,
+      fps: row.fps,
+      appDisplayName: appDisplayName || undefined,
+    },
+    severity: 'good',
+    analysisState: 'not_planned',
+  };
+}
+
+function sceneFromTvHalfScreenLaunch(row: Record<string, any>, index: number): DisplayedScene | null {
+  const startTs = String(row.ts ?? '');
+  const dur = String(row.dur ?? '0');
+  const endTs = safeAddNs(startTs, dur) ?? startTs;
+  if (!startTs) return null;
+  const durationMs = nsToMs(dur);
+  const safeDurationMs = Number.isFinite(durationMs) ? durationMs : 0;
+
+  const panelType = String(row.panel_type ?? '').trim();
+  const sceneType = panelType || 'tv_half_screen_launch';
+
+  return {
+    id: `tv_half_screen_launch-${index}`,
+    sceneType,
+    sourceStepId: 'tv_half_screen_launch',
+    startTs,
+    endTs,
+    durationMs: safeDurationMs,
+    processName: resolveProcessName(row),
+    label: `${displayNameOf(sceneType)} (${formatDuration(safeDurationMs)})`,
+    metadata: { panelType },
+    severity: severityFor('tv_half_screen_launch', safeDurationMs),
+    analysisState: 'not_planned',
+  };
 }

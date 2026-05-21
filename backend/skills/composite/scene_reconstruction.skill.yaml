@@ -1625,6 +1625,752 @@ steps:
     optional: true
 
   # ==========================================================================
+  # L2: TV 开机场景检测 (AC_ON 冷开机 / STR 挂起恢复)
+  # ==========================================================================
+  - id: tv_boot_events
+    type: atomic
+    name: "TV 开机场景"
+    display:
+      level: hidden
+      layer: list
+      title: "TV 开机场景"
+      columns:
+        - name: ts
+          label: "时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_range
+          durationColumn: dur
+        - name: dur
+          label: "持续"
+          type: duration
+          format: duration_ms
+          unit: ns
+        - name: event
+          label: "事件"
+          type: string
+        - name: boot_type
+          label: "类型"
+          type: string
+        - name: category
+          label: "类别"
+          type: string
+    sql: |
+      WITH boot_markers AS (
+        SELECT
+          s.ts,
+          s.dur,
+          s.name,
+          p.name AS process_name
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        JOIN process p ON t.upid = p.upid
+        WHERE (
+            -- Kernel/init boot markers
+            s.name GLOB '*boot*'
+            OR s.name GLOB '*Boot*'
+            OR s.name = 'init'
+            OR s.name GLOB '*system_server*init*'
+            OR s.name GLOB '*SystemServer*'
+            OR s.name GLOB '*PackageManagerService*'
+            OR s.name GLOB '*ActivityManagerService*start*'
+            -- STR suspend/resume markers
+            OR s.name GLOB '*suspend*'
+            OR s.name GLOB '*resume*'
+            OR s.name GLOB '*Suspend*'
+            OR s.name GLOB '*Resume*'
+            OR s.name GLOB '*PM_SUSPEND*'
+            OR s.name GLOB '*syscore_resume*'
+            OR s.name GLOB '*syscore_suspend*'
+          )
+          AND s.dur > 100000000
+      ),
+      boot_type AS (
+        SELECT
+          ts, dur, name, process_name,
+          CASE
+            WHEN name GLOB '*suspend*' OR name GLOB '*Suspend*' OR name = 'PM_SUSPEND'
+              OR name GLOB '*syscore_suspend*' THEN 'suspend'
+            WHEN name GLOB '*resume*' OR name GLOB '*Resume*' OR name GLOB '*syscore_resume*' THEN 'resume'
+            ELSE 'boot'
+          END AS phase
+        FROM boot_markers
+      ),
+      -- Detect STR resume: a resume marker that appears shortly after a suspend
+      str_resume AS (
+        SELECT
+          r.ts,
+          r.dur,
+          r.name,
+          r.process_name,
+          'STR' AS boot_type_label
+        FROM boot_type r
+        WHERE r.phase = 'resume'
+          AND r.ts < (SELECT COALESCE(MIN(ts), 0) FROM boot_type WHERE phase = 'boot')
+          AND EXISTS (
+            SELECT 1 FROM boot_type s
+            WHERE s.phase = 'suspend'
+              AND s.ts < r.ts
+              AND r.ts - (s.ts + s.dur) < 30000000000
+          )
+        ORDER BY r.ts
+        LIMIT 10
+      ),
+      -- Detect AC_ON cold boot: boot markers at the very start of trace
+      ac_on_boot AS (
+        SELECT
+          b.ts,
+          b.dur,
+          b.name,
+          b.process_name,
+          'AC_ON' AS boot_type_label
+        FROM boot_type b
+        WHERE b.phase = 'boot'
+          AND NOT EXISTS (
+            SELECT 1 FROM str_resume sr WHERE sr.ts <= b.ts
+          )
+        ORDER BY b.ts
+        LIMIT 10
+      ),
+      all_boot AS (
+        SELECT ts, dur, name, process_name, boot_type_label FROM str_resume
+        UNION ALL
+        SELECT ts, dur, name, process_name, boot_type_label FROM ac_on_boot
+      )
+      SELECT
+        printf('%d', ts) AS ts,
+        printf('%d', dur) AS dur,
+        CASE boot_type_label
+          WHEN 'STR' THEN 'STR开机 [' || CAST(dur / 1000000 AS INT) || 'ms]'
+          WHEN 'AC_ON' THEN 'AC_ON开机 [' || CAST(dur / 1000000 AS INT) || 'ms]'
+          ELSE '开机 [' || CAST(dur / 1000000 AS INT) || 'ms]'
+        END AS event,
+        CASE boot_type_label
+          WHEN 'STR' THEN 'tv_str_boot'
+          WHEN 'AC_ON' THEN 'tv_ac_on_boot'
+          ELSE 'tv_ac_on_boot'
+        END AS boot_type,
+        'tv_boot' AS category
+      FROM all_boot
+      ORDER BY ts
+      LIMIT 20
+    save_as: tv_boot_events
+    optional: true
+
+  # ==========================================================================
+  # L2: TV 语音唤醒场景 (近场遥控器 / 远场麦克风阵列)
+  # ==========================================================================
+  - id: tv_voice_interaction
+    type: atomic
+    name: "TV 语音唤醒"
+    display:
+      level: hidden
+      layer: list
+      title: "TV 语音唤醒"
+      columns:
+        - name: ts
+          label: "时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_range
+          durationColumn: dur
+        - name: dur
+          label: "持续"
+          type: duration
+          format: duration_ms
+          unit: ns
+        - name: event
+          label: "事件"
+          type: string
+        - name: voice_type
+          label: "类型"
+          type: string
+        - name: category
+          label: "类别"
+          type: string
+    sql: |
+      WITH voice_markers AS (
+        SELECT
+          s.ts,
+          s.dur,
+          s.name,
+          p.name AS process_name
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        LEFT JOIN process p ON t.upid = p.upid
+        WHERE (
+            -- Hotword / wake-word detection
+            s.name GLOB '*hotword*'
+            OR s.name GLOB '*Hotword*'
+            OR s.name GLOB '*wake_word*'
+            OR s.name GLOB '*WakeWord*'
+            OR s.name GLOB '*wakeword*'
+            OR s.name GLOB '*OKGoogle*'
+            OR s.name GLOB '*Alexa*'
+            OR s.name GLOB '*voice_trigger*'
+            OR s.name GLOB '*VoiceTrigger*'
+            -- Voice interaction session
+            OR s.name GLOB '*VoiceInteraction*'
+            OR s.name GLOB '*voice_interaction*'
+            OR s.name GLOB '*VoiceSession*'
+            OR s.name GLOB '*voice_session*'
+            -- Audio input / AEC / beamforming
+            OR s.name GLOB '*AEC*'
+            OR s.name GLOB '*aec*'
+            OR s.name GLOB '*beamform*'
+            OR s.name GLOB '*Beamform*'
+            OR s.name GLOB '*AudioRecord*'
+            OR s.name GLOB '*audio_record*'
+            -- ASR / NLU
+            OR s.name GLOB '*ASR*'
+            OR s.name GLOB '*asr*'
+            OR s.name GLOB '*SpeechRecognizer*'
+            OR s.name GLOB '*speech_recognizer*'
+            -- Assistant session
+            OR s.name GLOB '*AssistantSession*'
+            OR s.name GLOB '*assistant_session*'
+            OR s.name GLOB '*GoogleAssistant*'
+          )
+          AND s.dur > 1000000
+      ),
+      voice_typed AS (
+        SELECT
+          ts, dur, name, process_name,
+          CASE
+            -- Near-field: remote control mic (usually through input / key events)
+            WHEN name GLOB '*hotword*' OR name GLOB '*Hotword*'
+              OR name GLOB '*wake_word*' OR name GLOB '*WakeWord*'
+              OR name GLOB '*wakeword*' OR name GLOB '*voice_trigger*'
+              OR name GLOB '*VoiceTrigger*'
+            THEN 'near_field'
+            -- Far-field: TV mic array with AEC/beamforming
+            WHEN name GLOB '*AEC*' OR name GLOB '*aec*'
+              OR name GLOB '*beamform*' OR name GLOB '*Beamform*'
+            THEN 'far_field'
+            -- General voice interaction (classify by duration: long=far-field likely)
+            WHEN dur > 500000000 THEN 'far_field'
+            ELSE 'near_field'
+          END AS voice_category
+        FROM voice_markers
+      )
+      SELECT
+        printf('%d', ts) AS ts,
+        printf('%d', dur) AS dur,
+        CASE voice_category
+          WHEN 'near_field' THEN '近场语音唤醒 [' || CAST(dur / 1000000 AS INT) || 'ms]'
+          WHEN 'far_field' THEN '远场语音唤醒 [' || CAST(dur / 1000000 AS INT) || 'ms]'
+          ELSE '语音交互 [' || CAST(dur / 1000000 AS INT) || 'ms]'
+        END AS event,
+        CASE voice_category
+          WHEN 'near_field' THEN 'tv_voice_wakeup_near'
+          WHEN 'far_field' THEN 'tv_voice_wakeup_far'
+          ELSE 'tv_voice_wakeup_near'
+        END AS voice_type,
+        'tv_voice' AS category
+      FROM voice_typed
+      ORDER BY ts
+      LIMIT 50
+    save_as: tv_voice_events
+    optional: true
+
+  # ==========================================================================
+  # L2: TV 媒体播放场景 (4K60Hz / 本地媒体)
+  # ==========================================================================
+  - id: tv_media_playback
+    type: atomic
+    name: "TV 媒体播放"
+    display:
+      level: hidden
+      layer: list
+      title: "TV 媒体播放"
+      columns:
+        - name: ts
+          label: "时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_range
+          durationColumn: dur
+        - name: dur
+          label: "持续"
+          type: duration
+          format: duration_ms
+          unit: ns
+        - name: event
+          label: "事件"
+          type: string
+        - name: media_type
+          label: "类型"
+          type: string
+        - name: resolution
+          label: "分辨率"
+          type: string
+        - name: fps
+          label: "帧率"
+          type: string
+        - name: app_display_name
+          label: "应用"
+          type: string
+        - name: category
+          label: "类别"
+          type: string
+    sql: |
+      WITH media_codec_slices AS (
+        SELECT
+          s.ts,
+          s.dur,
+          s.name,
+          p.name AS process_name
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        LEFT JOIN process p ON t.upid = p.upid
+        WHERE (
+            s.name GLOB '*MediaCodec*'
+            OR s.name GLOB '*mediacodec*'
+            OR s.name GLOB '*Codec2*'
+            OR s.name GLOB '*codec2*'
+            OR s.name GLOB '*OMX*'
+            OR s.name GLOB '*omx*'
+            OR s.name GLOB '*CCodec*'
+            OR s.name GLOB '*ccodec*'
+            OR s.name GLOB '*VideoDecoder*'
+            OR s.name GLOB '*video_decoder*'
+            OR s.name GLOB '*AudioTrack*'
+            OR s.name GLOB '*audio_track*'
+            OR s.name GLOB '*ExoPlayer*'
+            OR s.name GLOB '*MediaPlayer*'
+          )
+          AND s.dur > 10000000
+      ),
+      -- Detect 4K content via resolution metadata in codec config or video size slices
+      video_resolution AS (
+        SELECT
+          ts, dur, name, process_name,
+          CASE
+            WHEN name GLOB '*3840*' OR name GLOB '*2160*' OR name GLOB '*4K*' OR name GLOB '*UHD*'
+              THEN '4K'
+            WHEN name GLOB '*1920*' OR name GLOB '*1080*' OR name GLOB '*FullHD*' OR name GLOB '*FHD*'
+              THEN '1080p'
+            WHEN name GLOB '*1280*' OR name GLOB '*720*'
+              THEN '720p'
+            ELSE 'unknown'
+          END AS resolution_label
+        FROM media_codec_slices
+      ),
+      -- Group consecutive codec activity into playback sessions (gap < 1s)
+      codec_sessions AS (
+        SELECT
+          ts, dur, name, process_name, resolution_label,
+          SUM(CASE WHEN prev_gap IS NULL OR prev_gap > 1000000000 THEN 1 ELSE 0 END)
+            OVER (ORDER BY ts) AS session_id
+        FROM (
+          SELECT
+            ts, dur, name, process_name, resolution_label,
+            ts - LAG(ts + dur) OVER (ORDER BY ts) AS prev_gap
+          FROM video_resolution
+        )
+      ),
+      -- ========== Signal 1: DRM/HDCP session → protected streaming ==========
+      drm_sessions AS (
+        SELECT
+          s.ts,
+          s.dur,
+          s.ts + s.dur AS end_ts
+        FROM slice s
+        WHERE (
+            s.name GLOB '*MediaDrm*'
+            OR s.name GLOB '*mediadrm*'
+            OR s.name GLOB '*DrmSession*'
+            OR s.name GLOB '*drm_session*'
+            OR s.name GLOB '*HDCP*'
+            OR s.name GLOB '*hdcp*'
+            OR s.name GLOB '*CryptoSession*'
+            OR s.name GLOB '*crypto_session*'
+            OR s.name GLOB '*Widevine*'
+            OR s.name GLOB '*widevine*'
+            OR s.name GLOB '*MediaCrypto*'
+            OR s.name GLOB '*media_crypto*'
+          )
+          AND s.dur > 10000000
+      ),
+      -- ========== Signal 2: Known streaming app packages → friendly names ==========
+      streaming_apps AS (
+        SELECT DISTINCT pkg, friendly_name FROM (
+          SELECT process_name AS pkg, process_name AS raw_pkg FROM media_codec_slices
+          UNION ALL
+          SELECT str_value AS pkg, str_value AS raw_pkg FROM android_battery_stats_event_slices
+          WHERE track_name = 'battery_stats.top'
+            AND EXISTS (SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name='android_battery_stats_event_slices')
+        ),
+        (SELECT 'netflix' AS pattern, 'Netflix' AS friendly_name UNION ALL
+         SELECT 'youtube', 'YouTube' UNION ALL
+         SELECT 'disney', 'Disney+' UNION ALL
+         SELECT 'prime_video', 'Amazon Prime Video' UNION ALL
+         SELECT 'amazon.avod', 'Amazon Prime Video' UNION ALL
+         SELECT 'amazon.ignition', 'Amazon Prime Video' UNION ALL
+         SELECT 'hulu', 'Hulu' UNION ALL
+         SELECT 'hbomax', 'Max' UNION ALL
+         SELECT 'hbo.max', 'Max' UNION ALL
+         SELECT 'paramount', 'Paramount+' UNION ALL
+         SELECT 'peacock', 'Peacock' UNION ALL
+         SELECT 'apple.tv', 'Apple TV' UNION ALL
+         SELECT 'tv.apple', 'Apple TV' UNION ALL
+         SELECT 'iqiyi', '爱奇艺' UNION ALL
+         SELECT 'tencent.video', '腾讯视频' UNION ALL
+         SELECT 'youku', '优酷' UNION ALL
+         SELECT 'bilibili', '哔哩哔哩' UNION ALL
+         SELECT 'mgtv', '芒果TV' UNION ALL
+         SELECT 'douban', '豆瓣'
+        ) app_map
+        WHERE pkg IS NOT NULL AND pkg != ''
+          AND LOWER(pkg) GLOB '*' || app_map.pattern || '*'
+      ),
+      -- ========== Signal 2b: Known local media player apps (positive signal) ==========
+      local_player_apps AS (
+        SELECT DISTINCT pkg FROM (
+          SELECT process_name AS pkg FROM media_codec_slices
+          UNION ALL
+          SELECT str_value AS pkg FROM android_battery_stats_event_slices
+          WHERE track_name = 'battery_stats.top'
+            AND EXISTS (SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name='android_battery_stats_event_slices')
+        )
+        WHERE pkg IS NOT NULL AND pkg != ''
+          AND (
+            LOWER(pkg) GLOB '*tcl*media*' OR LOWER(pkg) GLOB '*tcl.ui_media*'
+            OR LOWER(pkg) GLOB '*tcl.filebrowser*' OR LOWER(pkg) GLOB '*tcl.mediaplayer*'
+            OR LOWER(pkg) GLOB '*hisense*media*' OR LOWER(pkg) GLOB '*hisense*player*'
+            OR LOWER(pkg) GLOB '*skyworth*media*' OR LOWER(pkg) GLOB '*skyworth*player*'
+            OR LOWER(pkg) GLOB '*changhong*media*' OR LOWER(pkg) GLOB '*changhong*player*'
+            OR LOWER(pkg) GLOB '*kodi*'
+            OR LOWER(pkg) GLOB '*vlc*'
+            OR LOWER(pkg) GLOB '*mx.tech*mxplayer*' OR LOWER(pkg) GLOB '*mxplayer*'
+            OR LOWER(pkg) GLOB '*local*player*' OR LOWER(pkg) GLOB '*file*player*'
+            OR LOWER(pkg) GLOB '*usb*player*' OR LOWER(pkg) GLOB '*smb*player*'
+            OR LOWER(pkg) GLOB '*gallery*' OR LOWER(pkg) GLOB '*filemanager*' OR LOWER(pkg) GLOB '*files*'
+          )
+      ),
+      -- ========== Signal 3: Significant network I/O during session window ==========
+      network_activity AS (
+        SELECT
+          s.ts,
+          s.dur,
+          s.ts + s.dur AS end_ts,
+          CASE
+            WHEN s.name GLOB '*rx*' OR s.name GLOB '*RX*' OR s.name GLOB '*recv*'
+              OR s.name GLOB '*download*' OR s.name GLOB '*http*'
+            THEN 'rx'
+            ELSE 'other'
+          END AS direction
+        FROM slice s
+        WHERE (
+            s.name GLOB '*socket*read*'
+            OR s.name GLOB '*socket*write*'
+            OR s.name GLOB '*NetworkMonitor*'
+            OR s.name GLOB '*HttpEngine*'
+            OR s.name GLOB '*Cronet*'
+            OR s.name GLOB '*OkHttp*'
+            OR s.name GLOB '*DataSource*'
+            OR s.name GLOB '*CacheLoader*'
+          )
+          AND s.dur > 5000000
+      ),
+      -- Aggregate sessions with all signals
+      session_agg AS (
+        SELECT
+          session_id,
+          MIN(ts) AS ts,
+          SUM(dur) AS dur,
+          MAX(dur) AS max_dur,
+          MAX(resolution_label) AS resolution_label,
+          COUNT(*) AS codec_event_count,
+          MAX(process_name) AS process_name
+        FROM codec_sessions
+        GROUP BY session_id
+        HAVING SUM(dur) > 100000000
+      ),
+      -- Classify each session using the three signals
+      session_classified AS (
+        SELECT
+          sa.session_id,
+          sa.ts,
+          sa.dur,
+          sa.resolution_label,
+          sa.codec_event_count,
+          sa.process_name,
+          -- DRM overlap: any DRM session active during this codec session?
+          CASE WHEN EXISTS (
+            SELECT 1 FROM drm_sessions d
+            WHERE d.ts < sa.ts + sa.dur AND d.end_ts > sa.ts
+          ) THEN 1 ELSE 0 END AS has_drm,
+          -- Streaming app: process name matches known streaming packages
+          CASE WHEN EXISTS (
+            SELECT 1 FROM streaming_apps sp WHERE sp.pkg = sa.process_name
+          ) THEN 1 ELSE 0 END AS is_streaming_app,
+          -- Streaming app friendly name (NULL if not a streaming app)
+          (SELECT sp.friendly_name FROM streaming_apps sp WHERE sp.pkg = sa.process_name LIMIT 1) AS streaming_app_name,
+          -- Local player app: process name matches known local player packages
+          CASE WHEN EXISTS (
+            SELECT 1 FROM local_player_apps lp WHERE lp.pkg = sa.process_name
+          ) THEN 1 ELSE 0 END AS is_local_player,
+          -- Network activity: significant network I/O during session window
+          CASE WHEN (
+            SELECT COUNT(*) FROM network_activity na
+            WHERE na.ts >= sa.ts - 500000000 AND na.end_ts <= sa.ts + sa.dur + 500000000
+          ) >= 3 THEN 1 ELSE 0 END AS has_network_traffic,
+          -- Final classification: 4K > streaming (DRM/app/network) > local
+          CASE
+            WHEN sa.resolution_label = '4K' AND sa.codec_event_count > 10 THEN '4K_60fps'
+            WHEN sa.resolution_label = '4K' THEN '4K'
+            ELSE 'local'
+          END AS base_type
+        FROM session_agg sa
+      )
+      SELECT
+        printf('%d', ts) AS ts,
+        printf('%d', dur) AS dur,
+        CASE
+          WHEN base_type IN ('4K_60fps', '4K') THEN
+            CASE
+              WHEN has_drm = 1 OR is_streaming_app = 1
+                THEN COALESCE(streaming_app_name, '流媒体') || ' 4K播放 [' || CAST(dur / 1000000 AS INT) || 'ms]'
+                ELSE '4K媒体播放 [' || CAST(dur / 1000000 AS INT) || 'ms]'
+            END
+          WHEN has_drm = 1 THEN COALESCE(streaming_app_name, '流媒体') || ' 播放(DRM) [' || CAST(dur / 1000000 AS INT) || 'ms]'
+          WHEN is_streaming_app = 1 THEN COALESCE(streaming_app_name, '流媒体') || ' 播放 [' || CAST(dur / 1000000 AS INT) || 'ms]'
+          WHEN is_local_player = 1 THEN COALESCE(
+            (SELECT lp2.friendly_name FROM (
+              SELECT 'tcl.ui_media' AS pattern, 'TCL 媒体中心' AS friendly_name UNION ALL
+              SELECT 'tcl.filebrowser', 'TCL 文件浏览' UNION ALL
+              SELECT 'hisense*media', 'Hisense 媒体' UNION ALL
+              SELECT 'kodi', 'Kodi' UNION ALL
+              SELECT 'vlc', 'VLC'
+            ) lp2 WHERE LOWER(COALESCE(process_name, '')) GLOB '*' || lp2.pattern || '*'),
+            '本地媒体播放'
+          ) || ' [' || CAST(dur / 1000000 AS INT) || 'ms]'
+          WHEN has_network_traffic = 1 THEN '流媒体播放(网络) [' || CAST(dur / 1000000 AS INT) || 'ms]'
+          ELSE '媒体播放 [' || CAST(dur / 1000000 AS INT) || 'ms]'
+        END AS event,
+        CASE
+          WHEN base_type IN ('4K_60fps', '4K') THEN 'tv_4k60_media_playback'
+          WHEN has_drm = 1 OR is_streaming_app = 1 OR has_network_traffic = 1
+            THEN 'tv_streaming_playback'
+          WHEN is_local_player = 1 THEN 'tv_local_media_playback'
+          ELSE 'tv_local_media_playback'
+        END AS media_type,
+        resolution_label AS resolution,
+        CASE WHEN base_type = '4K_60fps' THEN '60fps' ELSE '' END AS fps,
+        COALESCE(streaming_app_name, '') AS app_display_name,
+        'tv_media' AS category
+      FROM session_classified
+      ORDER BY ts
+      LIMIT 50
+    save_as: tv_media_events
+    optional: true
+
+  # ==========================================================================
+  # L2: TV 半屏应用启动
+  #   Priority 1: TCL TV 专项 (launcherx Dashboard / tv.settings QuickPanel / systemui 面板)
+  #   Priority 2: 通用 Android PiP / 分屏兜底
+  # ==========================================================================
+  - id: tv_half_screen_launch
+    type: atomic
+    name: "TV 半屏启动"
+    display:
+      level: hidden
+      layer: list
+      title: "TV 半屏启动"
+      columns:
+        - name: ts
+          label: "时间"
+          type: timestamp
+          unit: ns
+          clickAction: navigate_range
+          durationColumn: dur
+        - name: dur
+          label: "持续"
+          type: duration
+          format: duration_ms
+          unit: ns
+        - name: event
+          label: "事件"
+          type: string
+        - name: panel_type
+          label: "面板类型"
+          type: string
+        - name: app_package
+          label: "应用"
+          type: string
+        - name: category
+          label: "类别"
+          type: string
+    sql: |
+      WITH half_panel_markers AS (
+        -- ===== Priority 1: TCL TV 专项 =====
+
+        -- Dashboard: launcherx Activity transitions (channel list, app drawer, search)
+        SELECT
+          s.ts, s.dur, s.name, p.name AS process_name,
+          'dashboard' AS panel_type
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        LEFT JOIN process p ON t.upid = p.upid
+        WHERE p.name GLOB '*launcherx*'
+          AND s.dur > 50000000
+          AND (
+            s.name GLOB '*Activity*'
+            OR s.name GLOB '*activity*'
+            OR s.name GLOB '*Dashboard*'
+            OR s.name GLOB '*dashboard*'
+            OR s.name GLOB '*onCreate*'
+            OR s.name GLOB '*onStart*'
+            OR s.name GLOB '*onResume*'
+            OR s.name GLOB '*AppTransition*'
+            OR s.name GLOB '*openAnimation*'
+            OR s.name GLOB '*Window*'
+          )
+
+        UNION ALL
+
+        -- QuickPanel / QuickSettings: tv.settings Service+Window overlay
+        SELECT
+          s.ts, s.dur, s.name, p.name AS process_name,
+          'quickpanel' AS panel_type
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        LEFT JOIN process p ON t.upid = p.upid
+        WHERE p.name GLOB '*tv.settings*'
+          AND s.dur > 50000000
+          AND (
+            s.name GLOB '*QuickPanel*'
+            OR s.name GLOB '*quickpanel*'
+            OR s.name GLOB '*QuickSettings*'
+            OR s.name GLOB '*quicksettings*'
+            OR s.name GLOB '*onCreate*'
+            OR s.name GLOB '*onStart*'
+            OR s.name GLOB '*onBind*'
+            OR s.name GLOB '*addView*'
+            OR s.name GLOB '*WindowManager*'
+            OR s.name GLOB '*AppTransition*'
+          )
+
+        UNION ALL
+
+        -- SystemUI overlay panels (notification shade, volume, input source)
+        SELECT
+          s.ts, s.dur, s.name, p.name AS process_name,
+          'systemui' AS panel_type
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        LEFT JOIN process p ON t.upid = p.upid
+        WHERE p.name GLOB '*systemui*'
+          AND s.dur > 50000000
+          AND (
+            s.name GLOB '*Panel*'
+            OR s.name GLOB '*panel*'
+            OR s.name GLOB '*Overlay*'
+            OR s.name GLOB '*overlay*'
+            OR s.name GLOB '*QSPanel*'
+            OR s.name GLOB '*Notification*'
+            OR s.name GLOB '*notification*'
+            OR s.name GLOB '*VolumeDialog*'
+            OR s.name GLOB '*InputSource*'
+            OR s.name GLOB '*TvPip*'
+          )
+
+        UNION ALL
+
+        -- ===== Priority 2: 通用 PiP / 分屏兜底 =====
+
+        -- PiP events
+        SELECT
+          s.ts, s.dur, s.name, p.name AS process_name,
+          'pip' AS panel_type
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        LEFT JOIN process p ON t.upid = p.upid
+        WHERE (
+            LOWER(s.name) LIKE '%enterpictureinpicture%'
+            OR LOWER(s.name) LIKE '%exitpictureinpicture%'
+          )
+          AND s.dur > 100000000
+
+        UNION ALL
+
+        -- Split-screen events
+        SELECT
+          s.ts, s.dur, s.name, p.name AS process_name,
+          'split' AS panel_type
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        JOIN thread t ON tt.utid = t.utid
+        LEFT JOIN process p ON t.upid = p.upid
+        WHERE (
+            LOWER(s.name) LIKE '%splitscreen%'
+            OR LOWER(s.name) LIKE '%split_screen%'
+            OR s.name GLOB '*StageCoordinator*'
+            OR s.name GLOB '*SplitScreenTaskOrganizer*'
+          )
+          AND s.dur > 100000000
+      ),
+      -- Group consecutive markers from the same panel type into sessions
+      panel_sessions AS (
+        SELECT
+          ts, dur, name, process_name, panel_type,
+          SUM(CASE WHEN prev_gap IS NULL OR prev_gap > 500000000 THEN 1 ELSE 0 END)
+            OVER (ORDER BY ts) AS session_id
+        FROM (
+          SELECT ts, dur, name, process_name, panel_type,
+            ts - LAG(ts + dur) OVER (PARTITION BY panel_type ORDER BY ts) AS prev_gap
+          FROM half_panel_markers
+        )
+      ),
+      session_agg AS (
+        SELECT
+          session_id,
+          MIN(ts) AS ts,
+          SUM(dur) AS dur,
+          MAX(dur) AS max_dur,
+          COUNT(*) AS event_count,
+          MAX(process_name) AS process_name,
+          MAX(panel_type) AS panel_type
+        FROM panel_sessions
+        GROUP BY session_id
+        HAVING SUM(dur) > 50000000
+      )
+      SELECT
+        printf('%d', ts) AS ts,
+        printf('%d', dur) AS dur,
+        CASE panel_type
+          WHEN 'dashboard' THEN '半屏Dashboard [' || CAST(dur / 1000000 AS INT) || 'ms, ' || event_count || ' events]'
+          WHEN 'quickpanel' THEN '半屏QuickPanel [' || CAST(dur / 1000000 AS INT) || 'ms, ' || event_count || ' events]'
+          WHEN 'systemui' THEN '半屏系统面板 [' || CAST(dur / 1000000 AS INT) || 'ms, ' || event_count || ' events]'
+          WHEN 'pip' THEN '半屏画中画 [' || CAST(dur / 1000000 AS INT) || 'ms]'
+          WHEN 'split' THEN '半屏分屏 [' || CAST(dur / 1000000 AS INT) || 'ms]'
+          ELSE '半屏面板 [' || CAST(dur / 1000000 AS INT) || 'ms]'
+        END AS event,
+        CASE panel_type
+          WHEN 'dashboard' THEN 'tv_half_screen_dashboard'
+          WHEN 'quickpanel' THEN 'tv_half_screen_quickpanel'
+          WHEN 'systemui' THEN 'tv_half_screen_systemui'
+          WHEN 'pip' THEN 'tv_half_screen_launch'
+          WHEN 'split' THEN 'tv_half_screen_launch'
+          ELSE 'tv_half_screen_launch'
+        END AS panel_type,
+        process_name AS app_package,
+        'tv_half_screen' AS category
+      FROM session_agg
+      ORDER BY ts
+      LIMIT 30
+    save_as: tv_half_screen_events
+    optional: true
+
+  # ==========================================================================
   # L2: 设备状态（CPU频率/内存压力/温度/充电）
   # ==========================================================================
   - id: device_state
@@ -2417,6 +3163,140 @@ steps:
                OR s.name GLOB '*startingWindow*')
         LIMIT 30
       ),
+      -- ========== 数据源 11: TV 开机场景 ==========
+      tv_boot_ev AS (
+        SELECT
+          printf('%d', s.ts) AS ts,
+          printf('%d', s.dur) AS dur,
+          s.name AS event,
+          CASE
+            WHEN s.name GLOB '*suspend*' OR s.name GLOB '*Suspend*' OR s.name = 'PM_SUSPEND'
+              OR s.name GLOB '*syscore_suspend*' THEN 'suspend'
+            WHEN s.name GLOB '*resume*' OR s.name GLOB '*Resume*' OR s.name GLOB '*syscore_resume*' THEN 'tv_str_boot'
+            ELSE 'tv_ac_on_boot'
+          END AS event_type,
+          NULL AS app_package, 'tv_boot' AS category, 1 AS priority
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id JOIN thread t ON tt.utid = t.utid
+        WHERE (
+            s.name GLOB '*SystemServer*' OR s.name GLOB '*PackageManagerService*'
+            OR s.name GLOB '*syscore_resume*' OR s.name GLOB '*PM_SUSPEND*'
+          )
+          AND s.dur > 100000000
+        LIMIT 10
+      ),
+      -- ========== 数据源 12: TV 语音唤醒 ==========
+      tv_voice_ev AS (
+        SELECT
+          printf('%d', s.ts) AS ts, printf('%d', s.dur) AS dur,
+          CASE
+            WHEN s.name GLOB '*AEC*' OR s.name GLOB '*aec*' OR s.name GLOB '*beamform*'
+            THEN '远场语音唤醒 [' || CAST(s.dur / 1000000 AS INT) || 'ms]'
+            WHEN s.name GLOB '*hotword*' OR s.name GLOB '*Hotword*' OR s.name GLOB '*wakeword*'
+              OR s.name GLOB '*WakeWord*' OR s.name GLOB '*voice_trigger*'
+            THEN '近场语音唤醒 [' || CAST(s.dur / 1000000 AS INT) || 'ms]'
+            ELSE '语音交互 [' || CAST(s.dur / 1000000 AS INT) || 'ms]'
+          END AS event,
+          CASE
+            WHEN s.name GLOB '*AEC*' OR s.name GLOB '*aec*' OR s.name GLOB '*beamform*'
+            THEN 'tv_voice_wakeup_far'
+            ELSE 'tv_voice_wakeup_near'
+          END AS event_type,
+          NULL AS app_package, 'tv_voice' AS category, 2 AS priority
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        WHERE (
+            s.name GLOB '*hotword*' OR s.name GLOB '*Hotword*'
+            OR s.name GLOB '*wakeword*' OR s.name GLOB '*WakeWord*'
+            OR s.name GLOB '*AEC*' OR s.name GLOB '*aec*'
+            OR s.name GLOB '*beamform*' OR s.name GLOB '*voice_trigger*'
+            OR s.name GLOB '*VoiceInteraction*'
+            OR s.name GLOB '*SpeechRecognizer*'
+          )
+          AND s.dur > 10000000
+        LIMIT 30
+      ),
+      -- ========== 数据源 13: TV 媒体播放 ==========
+      tv_media_ev AS (
+        SELECT
+          printf('%d', s.ts) AS ts, printf('%d', s.dur) AS dur,
+          CASE
+            WHEN s.name GLOB '*3840*' OR s.name GLOB '*2160*' OR s.name GLOB '*4K*' OR s.name GLOB '*UHD*'
+            THEN '4K60Hz媒体播放 [' || CAST(s.dur / 1000000 AS INT) || 'ms]'
+            WHEN LOWER(s.name) GLOB '*drm*' OR LOWER(s.name) GLOB '*widevine*' OR LOWER(s.name) GLOB '*hdcp*'
+            THEN '流媒体播放(DRM) [' || CAST(s.dur / 1000000 AS INT) || 'ms]'
+            ELSE '本地媒体播放 [' || CAST(s.dur / 1000000 AS INT) || 'ms]'
+          END AS event,
+          CASE
+            WHEN s.name GLOB '*3840*' OR s.name GLOB '*2160*' OR s.name GLOB '*4K*' OR s.name GLOB '*UHD*'
+            THEN 'tv_4k60_media_playback'
+            WHEN LOWER(s.name) GLOB '*drm*' OR LOWER(s.name) GLOB '*widevine*' OR LOWER(s.name) GLOB '*hdcp*'
+            THEN 'tv_streaming_playback'
+            ELSE 'tv_local_media_playback'
+          END AS event_type,
+          NULL AS app_package, 'tv_media' AS category, 3 AS priority
+        FROM slice s
+        JOIN thread_track tt ON s.track_id = tt.id
+        WHERE (
+            s.name GLOB '*MediaCodec*' OR s.name GLOB '*mediacodec*'
+            OR s.name GLOB '*Codec2*' OR s.name GLOB '*OMX*'
+            OR s.name GLOB '*VideoDecoder*' OR s.name GLOB '*ExoPlayer*'
+            OR s.name GLOB '*MediaDrm*' OR s.name GLOB '*Widevine*' OR s.name GLOB '*HDCP*'
+          )
+          AND s.dur > 100000000
+        LIMIT 30
+      ),
+      -- ========== 数据源 14: TV 半屏启动 ==========
+      tv_half_ev AS (
+        SELECT ts, dur, event, event_type, app_package, category, priority FROM (
+          -- Priority 1: TCL TV specific panels
+          SELECT
+            printf('%d', s.ts) AS ts,
+            printf('%d', s.dur) AS dur,
+            CASE
+              WHEN p.name GLOB '*launcherx*' THEN '半屏Dashboard [' || CAST(s.dur / 1000000 AS INT) || 'ms]'
+              WHEN p.name GLOB '*tv.settings*' THEN '半屏QuickPanel [' || CAST(s.dur / 1000000 AS INT) || 'ms]'
+              WHEN p.name GLOB '*systemui*' THEN '半屏系统面板 [' || CAST(s.dur / 1000000 AS INT) || 'ms]'
+              ELSE NULL
+            END AS event,
+            'tv_half_screen_launch' AS event_type,
+            p.name AS app_package, 'tv_half_screen' AS category, 2 AS priority
+          FROM slice s
+          JOIN thread_track tt ON s.track_id = tt.id
+          JOIN thread t ON tt.utid = t.utid
+          JOIN process p ON t.upid = p.upid
+          WHERE (
+              (p.name GLOB '*launcherx*'
+                AND (s.name GLOB '*Activity*' OR s.name GLOB '*Dashboard*' OR s.name GLOB '*AppTransition*'))
+              OR (p.name GLOB '*tv.settings*'
+                AND (s.name GLOB '*QuickPanel*' OR s.name GLOB '*QuickSettings*' OR s.name GLOB '*onCreate*'))
+              OR (p.name GLOB '*systemui*'
+                AND (s.name GLOB '*Panel*' OR s.name GLOB '*Overlay*' OR s.name GLOB '*VolumeDialog*'))
+            )
+            AND s.dur > 50000000
+
+          UNION ALL
+
+          -- Priority 2: Generic PiP / split-screen fallback
+          SELECT
+            printf('%d', s.ts) AS ts,
+            printf('%d', s.dur) AS dur,
+            CASE
+              WHEN LOWER(s.name) LIKE '%enterpictureinpicture%' THEN '半屏画中画 [' || CAST(s.dur / 1000000 AS INT) || 'ms]'
+              WHEN LOWER(s.name) LIKE '%splitscreen%' THEN '半屏分屏 [' || CAST(s.dur / 1000000 AS INT) || 'ms]'
+              ELSE NULL
+            END AS event,
+            'tv_half_screen_launch' AS event_type,
+            NULL AS app_package, 'tv_half_screen' AS category, 2 AS priority
+          FROM slice s
+          WHERE (
+              (LOWER(s.name) LIKE '%enterpictureinpicture%' AND s.dur > 100000000)
+              OR (LOWER(s.name) LIKE '%splitscreen%' AND s.dur > 100000000)
+            )
+        ) sub
+        WHERE event IS NOT NULL
+        LIMIT 20
+      ),
       -- ========== 合并 + 过滤 + 排序 ==========
       all_events AS (
         SELECT ts, dur, event, event_type, app_package, category, priority FROM launch_ev
@@ -2436,6 +3316,14 @@ steps:
         SELECT ts, dur, event, event_type, app_package, category, priority FROM ime_ev
         UNION ALL
         SELECT ts, dur, event, event_type, app_package, category, priority FROM win_trans_ev
+        UNION ALL
+        SELECT ts, dur, event, event_type, app_package, category, priority FROM tv_boot_ev
+        UNION ALL
+        SELECT ts, dur, event, event_type, app_package, category, priority FROM tv_voice_ev
+        UNION ALL
+        SELECT ts, dur, event, event_type, app_package, category, priority FROM tv_media_ev
+        UNION ALL
+        SELECT ts, dur, event, event_type, app_package, category, priority FROM tv_half_ev WHERE event IS NOT NULL
       ),
       -- ========== 格式化输出 ==========
       ranked AS (
@@ -2477,6 +3365,27 @@ steps:
           WHEN event_type = 'window_transition' AND dur / 1e6 < 300 THEN '🟢'
           WHEN event_type = 'window_transition' AND dur / 1e6 < 500 THEN '🟡'
           WHEN event_type = 'window_transition' THEN '🔴'
+          -- TV 开机评级
+          WHEN event_type = 'tv_ac_on_boot' AND dur / 1e6 < 10000 THEN '🟢'
+          WHEN event_type = 'tv_ac_on_boot' AND dur / 1e6 < 20000 THEN '🟡'
+          WHEN event_type = 'tv_ac_on_boot' THEN '🔴'
+          WHEN event_type = 'tv_str_boot' AND dur / 1e6 < 3000 THEN '🟢'
+          WHEN event_type = 'tv_str_boot' AND dur / 1e6 < 5000 THEN '🟡'
+          WHEN event_type = 'tv_str_boot' THEN '🔴'
+          -- TV 语音唤醒评级
+          WHEN event_type = 'tv_voice_wakeup_near' AND dur / 1e6 < 500 THEN '🟢'
+          WHEN event_type = 'tv_voice_wakeup_near' AND dur / 1e6 < 1000 THEN '🟡'
+          WHEN event_type = 'tv_voice_wakeup_near' THEN '🔴'
+          WHEN event_type = 'tv_voice_wakeup_far' AND dur / 1e6 < 800 THEN '🟢'
+          WHEN event_type = 'tv_voice_wakeup_far' AND dur / 1e6 < 1500 THEN '🟡'
+          WHEN event_type = 'tv_voice_wakeup_far' THEN '🔴'
+          -- TV 媒体播放评级 (以卡顿判断，长时长正常)
+          WHEN event_type = 'tv_4k60_media_playback' THEN '🟢'
+          WHEN event_type = 'tv_local_media_playback' THEN '🟢'
+          -- TV 半屏启动评级
+          WHEN event_type = 'tv_half_screen_launch' AND dur / 1e6 < 500 THEN '🟢'
+          WHEN event_type = 'tv_half_screen_launch' AND dur / 1e6 < 1000 THEN '🟡'
+          WHEN event_type = 'tv_half_screen_launch' THEN '🔴'
           -- 其他事件不评级
           ELSE ''
         END AS rating
@@ -2704,6 +3613,10 @@ steps:
       - device_state
       - app_state_tracking
       - operation_chain
+      - tv_boot_events
+      - tv_voice_interaction
+      - tv_media_playback
+      - tv_half_screen_launch
     prompt: |
       你是一位 Android 性能分析专家，你的任务是帮助初学者理解 Trace 数据。
       请基于以下数据还原用户的完整操作场景，并用通俗易懂的语言解释。
@@ -2756,6 +3669,22 @@ steps:
       ## 操作链
       ${operation_chain}
       说明：按时间顺序排列的所有用户可感知事件，用于构建完整操作时间线
+
+      ## TV 开机场景
+      ${tv_boot_events}
+      说明：TV 特有的开机场景，AC_ON 表示冷开机（从断电状态开机），STR 表示挂起恢复（从待机状态恢复）
+
+      ## TV 语音唤醒
+      ${tv_voice_interaction}
+      说明：TV 语音交互场景，近场 = 遥控器麦克风，远场 = TV 麦克风阵列（含 AEC 回声消除和波束成形）
+
+      ## TV 媒体播放
+      ${tv_media_playback}
+      说明：TV 媒体播放场景，包括 4K60Hz 高清播放和本地媒体播放
+
+      ## TV 半屏应用启动
+      ${tv_half_screen_launch}
+      说明：TV 半屏模式下的应用启动，包括画中画(PiP)和分屏模式
 
       请按以下格式输出分析报告：
 

@@ -28,6 +28,10 @@ export type SceneTypeGroup =
   | 'idle'
   | 'jank_region'
   | 'anr'
+  | 'tv_boot'
+  | 'tv_voice'
+  | 'tv_media'
+  | 'tv_half_screen'
   | 'all';
 
 export interface SceneReconstructionRouteRule {
@@ -200,6 +204,49 @@ export const DEFAULT_DOMAIN_MANIFEST: DomainManifest = {
         end_ts: 'endTs',
       },
     },
+    {
+      id: 'tv_boot_deep_dive',
+      eventTypes: ['tv_ac_on_boot', 'tv_str_boot'],
+      skillId: 'startup_analysis',
+      description: 'TV 开机性能分析',
+      paramMapping: {
+        start_ts: 'startTs',
+        end_ts: 'endTs',
+        package: 'processName',
+      },
+    },
+    {
+      id: 'tv_voice_deep_dive',
+      eventTypes: ['tv_voice_wakeup_near', 'tv_voice_wakeup_far'],
+      skillId: 'voice_interaction_latency',
+      description: 'TV 语音唤醒分析',
+      paramMapping: {
+        start_ts: 'startTs',
+        end_ts: 'endTs',
+      },
+    },
+    {
+      id: 'tv_media_deep_dive',
+      eventTypes: ['tv_4k60_media_playback', 'tv_local_media_playback', 'tv_streaming_playback'],
+      skillId: 'media_codec_activity',
+      description: 'TV 媒体播放分析',
+      paramMapping: {
+        start_ts: 'startTs',
+        end_ts: 'endTs',
+        package: 'processName',
+      },
+    },
+    {
+      id: 'tv_half_screen_deep_dive',
+      eventTypes: ['tv_half_screen_launch', 'tv_half_screen_dashboard', 'tv_half_screen_quickpanel', 'tv_half_screen_systemui'],
+      skillId: 'startup_analysis',
+      description: 'TV 半屏启动分析',
+      paramMapping: {
+        start_ts: 'startTs',
+        end_ts: 'endTs',
+        package: 'processName',
+      },
+    },
   ],
   baselineEvidence: '关键指标基线（时间窗、进程、刷新率口径一致）',
   fallbackEvidence: [
@@ -218,6 +265,10 @@ const SCENE_TYPE_GROUPS: Record<Exclude<SceneTypeGroup, 'all'>, string[]> = {
   idle: ['idle'],
   jank_region: ['jank_region'],
   anr: ['anr'],
+  tv_boot: ['tv_ac_on_boot', 'tv_str_boot'],
+  tv_voice: ['tv_voice_wakeup_near', 'tv_voice_wakeup_far'],
+  tv_media: ['tv_4k60_media_playback', 'tv_local_media_playback', 'tv_streaming_playback'],
+  tv_half_screen: ['tv_half_screen_launch', 'tv_half_screen_dashboard', 'tv_half_screen_quickpanel', 'tv_half_screen_systemui'],
 };
 
 function normalizeToken(value: string): string {

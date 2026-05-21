@@ -178,6 +178,8 @@ const makeApiKeyIdentity = (apiKey: string): ResolvedIdentity => ({
   email: '',
   subscription: 'pro',
   authType: 'api_key',
+  roles: ['admin'],
+  scopes: ['*'],
 });
 
 const resolveTrustedSsoIdentity = (req: Request): ResolvedIdentity | null => {
@@ -256,6 +258,13 @@ export const authenticate = async (
   res: Response,
   next: NextFunction
 ): Promise<void> => {
+  // Skip auth for unauthenticated health/readiness probes
+  if (req.method === 'GET' && /\/traces\/health\/?$/.test(req.path)) {
+    attachIdentity(req, makeDevIdentity());
+    next();
+    return;
+  }
+
   const ssoIdentity = resolveTrustedSsoIdentity(req);
   if (ssoIdentity) {
     attachIdentity(req, ssoIdentity);

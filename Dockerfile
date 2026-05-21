@@ -37,27 +37,35 @@ FROM debian:bookworm-slim AS tp-downloader
 ARG TRACE_PROCESSOR_DOWNLOAD_BASE=
 ARG TRACE_PROCESSOR_DOWNLOAD_URL=
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
+# Try local cache first (.docker-cache/trace_processor_shell)
+# If present, skip network download entirely
+COPY .docker-cache/trace_processor_shell /tmp/cache_tp_shell
 COPY scripts/trace-processor-pin.env /tmp/pin.env
 
-RUN . /tmp/pin.env && \
-    ARCH=$(uname -m) && \
-    case "$ARCH" in \
-      x86_64)  PLAT=linux-amd64; SHA="$PERFETTO_SHELL_SHA256_LINUX_AMD64" ;; \
-      aarch64) PLAT=linux-arm64; SHA="$PERFETTO_SHELL_SHA256_LINUX_ARM64" ;; \
-      *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
-    esac && \
-    URL_BASE="${TRACE_PROCESSOR_DOWNLOAD_BASE:-$PERFETTO_LUCI_URL_BASE}" && \
-    URL="${TRACE_PROCESSOR_DOWNLOAD_URL:-${URL_BASE%/}/${PERFETTO_VERSION}/${PLAT}/trace_processor_shell}" && \
-    curl -fL --max-time 120 -o /tmp/trace_processor_shell \
-      "$URL" && \
-    echo "${SHA}  /tmp/trace_processor_shell" | sha256sum -c - && \
-    chmod +x /tmp/trace_processor_shell && \
-    /tmp/trace_processor_shell --version | head -n 1
+RUN if [ -s /tmp/cache_tp_shell ] && [ -x /tmp/cache_tp_shell ]; then \
+      echo "Using cached trace_processor_shell" && \
+      cp /tmp/cache_tp_shell /tmp/trace_processor_shell && \
+      /tmp/trace_processor_shell --version | head -n 1; \
+    else \
+      apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        && rm -rf /var/lib/apt/lists/* && \
+      . /tmp/pin.env && \
+      ARCH=$(uname -m) && \
+      case "$ARCH" in \
+        x86_64)  PLAT=linux-amd64; SHA="$PERFETTO_SHELL_SHA256_LINUX_AMD64" ;; \
+        aarch64) PLAT=linux-arm64; SHA="$PERFETTO_SHELL_SHA256_LINUX_ARM64" ;; \
+        *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
+      esac && \
+      URL_BASE="${TRACE_PROCESSOR_DOWNLOAD_BASE:-$PERFETTO_LUCI_URL_BASE}" && \
+      URL="${TRACE_PROCESSOR_DOWNLOAD_URL:-${URL_BASE%/}/${PERFETTO_VERSION}/${PLAT}/trace_processor_shell}" && \
+      curl -fL --max-time 300 -o /tmp/trace_processor_shell \
+        "$URL" && \
+      echo "${SHA}  /tmp/trace_processor_shell" | sha256sum -c - && \
+      chmod +x /tmp/trace_processor_shell && \
+      /tmp/trace_processor_shell --version | head -n 1; \
+    fi
 
 # ============================
 # Stage 4: Verify pre-built frontend

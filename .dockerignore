@@ -63,3 +63,6 @@ Feature-Dev/
 Dockerfile
 docker-compose.yml
 .dockerignore
+
+# Docker cache (local prebuilt binaries for slow networks)
+!.docker-cache/

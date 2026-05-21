@@ -359,7 +359,7 @@ export function buildSystemPromptParts(
 
   // ── Device profile from bugreport ──
   if (context.deviceProfile) {
-    push(2, 'device_profile', context.deviceProfile, true);
+    push(2, 'device_profile', context.deviceProfile, false);
   }
 
   // ── HarmonyOS context injection ──

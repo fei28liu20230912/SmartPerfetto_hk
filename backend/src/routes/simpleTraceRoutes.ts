@@ -52,7 +52,7 @@ import {
  writeTraceMetadata,
  isSafeTraceId,
 } from '../services/traceMetadataStore';
-import { parseBugreportFile, formatDeviceProfileForPrompt } from '../services/bugreportParser';
+import { parseBugreportFile, formatDeviceProfileForPrompt, inferVoiceAssistantFromTrace, type DeviceProfile } from '../services/bugreportParser';
 import { isPrivilegedRequestContext, sendResourceNotFound } from '../services/resourceOwnership';
 import {
   canDeleteTraceResource,
@@ -810,6 +810,37 @@ router.post(
 
       // Parse the bugreport
       const profile = await parseBugreportFile(bugreportPath);
+
+      // Try to detect voice assistant from trace process activity (higher priority than bugreport inference)
+      try {
+        const tps = getTraceProcessorService();
+        const traceQueryFn = async (sql: string) => {
+          const result = await tps.query(traceId, sql);
+          return { rows: (result as any).rows || [] };
+        };
+        const fromTrace = await inferVoiceAssistantFromTrace(traceId, traceQueryFn);
+        if (fromTrace && fromTrace.assistant !== 'unknown') {
+          console.log(`[bugreport] Voice assistant from trace overrides bugreport: ${profile.voiceAssistant} → ${fromTrace.assistant}`);
+          profile.voiceAssistant = fromTrace.assistant;
+        }
+      } catch (traceErr: any) {
+        console.log(`[bugreport] Trace voice detection skipped: ${traceErr.message}`);
+      }
+
+      // Fallback: infer voice assistant from OS variant if still unknown
+      if (profile.voiceAssistant === 'unknown') {
+        const osVoiceMap: Record<string, DeviceProfile['voiceAssistant']> = {
+          'google_tv': 'katniss',
+          'firetv': 'vizzini',
+          'aosp_china': 'walleve',
+        };
+        const inferred = osVoiceMap[profile.osVariant];
+        if (inferred) {
+          console.log(`[bugreport] Voice assistant inferred from OS variant: ${profile.osVariant} → ${inferred}`);
+          profile.voiceAssistant = inferred;
+        }
+      }
+
       const profileText = formatDeviceProfileForPrompt(profile);
 
       // Clean up the uploaded bugreport file
@@ -841,6 +872,16 @@ router.post(
           cpuCoreCount: profile.cpuCoreCount,
           gpuDriver: profile.gpuDriver,
           voiceAssistant: profile.voiceAssistant,
+          cpuFreq: profile.cpuFreq,
+          swappiness: profile.swappiness,
+          zramSizeMb: profile.zramSizeMb,
+          readaheadKb: profile.readaheadKb,
+          displayResolution: profile.displayResolution,
+          displayRefreshRate: profile.displayRefreshRate,
+          gpuRenderer: profile.gpuRenderer,
+          securityPatch: profile.securityPatch,
+          buildType: profile.buildType,
+          kernelVersion: profile.kernelVersion,
         },
       });
     } catch (error: any) {
